@@ -92,6 +92,15 @@ def parse_scenario(scenario_path: Path) -> dict[str, Any]:
     data = tomli.loads(toml_data)
 
     participants = data.get("participants", [])
+
+    # Check for duplicate participant names
+    names = [p.get("name") for p in participants]
+    duplicates = [name for name in set(names) if names.count(name) > 1]
+    if duplicates:
+        print(f"Error: Duplicate participant names found: {', '.join(duplicates)}")
+        print("Each participant must have a unique name.")
+        sys.exit(1)
+
     for participant in participants:
         if "agentbeats_id" not in participant:
             print(f"Error: Participant '{participant.get('name', 'unknown')}' is missing 'agentbeats_id' field")
