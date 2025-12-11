@@ -59,6 +59,9 @@ jobs:
       - name: Run assessment
         run: docker compose up --exit-code-from agentbeats-client --abort-on-container-exit
 
+      - name: Record provenance
+        run: python record_provenance.py --scenario scenario.toml --output output/provenance.json
+
       - name: Generate submission metadata
         id: metadata
         run: |
@@ -72,6 +75,7 @@ jobs:
         run: |
           cp scenario.toml submissions/${{ steps.metadata.outputs.unique_name }}.toml
           cp output/results.json results/${{ steps.metadata.outputs.unique_name }}.json
+          cp output/provenance.json submissions/${{ steps.metadata.outputs.unique_name }}.provenance.json
 
       - name: Determine target repository
         id: target
@@ -92,7 +96,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add submissions/${{ steps.metadata.outputs.unique_name }}.toml results/${{ steps.metadata.outputs.unique_name }}.json
+          git add submissions/${{ steps.metadata.outputs.unique_name }}.toml submissions/${{ steps.metadata.outputs.unique_name }}.provenance.json results/${{ steps.metadata.outputs.unique_name }}.json
           git commit -m "Submission: ${{ steps.metadata.outputs.unique_name }}
 
           Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
