@@ -47,6 +47,7 @@ services:
       - agent-network
 
 {participant_services}
+{environment_services}
   agentbeats-client:
     image: ghcr.io/agentbeats/agentbeats-client:v1.0.0
     platform: linux/amd64
@@ -70,12 +71,22 @@ PARTICIPANT_TEMPLATE = """  {name}:
     container_name: {name}
     command: ["--host", "0.0.0.0", "--port", "{port}", "--card-url", "http://{name}:{port}"]
     environment:{env}
+    depends_on:{participant_depends}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:{port}/.well-known/agent-card.json"]
       interval: 5s
       timeout: 3s
       retries: 10
       start_period: 30s
+    networks:
+      - agent-network
+"""
+
+ENVIRONMENT_TEMPLATE = """  {name}:
+    image: {image}
+    platform: linux/amd64
+    container_name: {name}
+    environment:{env}
     networks:
       - agent-network
 """
@@ -121,6 +132,8 @@ def format_env_vars(env_dict: dict) -> str:
 
 
 def format_depends_on(services: list) -> str:
+    if not services:
+        return " []"
     lines = []
     for service in services:
         lines.append(f"      {service}:")
@@ -131,27 +144,42 @@ def format_depends_on(services: list) -> str:
 def generate_docker_compose(scenario: dict[str, Any]) -> str:
     green = scenario["green_agent"]
     participants = scenario.get("participants", [])
+    environments = scenario.get("environments", [])
 
     participant_names = [p["name"] for p in participants]
+    environment_names = [e["name"] for e in environments]
+
+    # Green agent depends on both environments and participants
+    green_depends_services = participant_names + environment_names
+    all_services = green_depends_services + ["green-agent"]
 
     participant_services = "\n".join([
         PARTICIPANT_TEMPLATE.format(
             name=p["name"],
             image=p["image"],
             port=DEFAULT_PORT,
-            env=format_env_vars(p.get("env", {}))
+            env=format_env_vars(p.get("env", {})),
+            participant_depends=format_depends_on(environment_names)
         )
         for p in participants
     ])
 
-    all_services = ["green-agent"] + participant_names
+    environment_services = "\n".join([
+        ENVIRONMENT_TEMPLATE.format(
+            name=e["name"],
+            image=e["image"],
+            env=format_env_vars(e.get("env", {}))
+        )
+        for e in environments
+    ])
 
     return COMPOSE_TEMPLATE.format(
         green_image=green["image"],
         green_port=DEFAULT_PORT,
         green_env=format_env_vars(green.get("env", {})),
-        green_depends=format_depends_on(participant_names),
+        green_depends=format_depends_on(green_depends_services),
         participant_services=participant_services,
+        environment_services=environment_services,
         client_depends=format_depends_on(all_services)
     )
 
@@ -182,6 +210,7 @@ def generate_a2a_scenario(scenario: dict[str, Any]) -> str:
 def generate_env_file(scenario: dict[str, Any]) -> str:
     green = scenario["green_agent"]
     participants = scenario.get("participants", [])
+    environments = scenario.get("environments", [])
 
     secrets = set()
 
@@ -194,6 +223,11 @@ def generate_env_file(scenario: dict[str, Any]) -> str:
 
     for p in participants:
         for value in p.get("env", {}).values():
+            for match in env_var_pattern.findall(str(value)):
+                secrets.add(match)
+
+    for e in environments:
+        for value in e.get("env", {}).values():
             for match in env_var_pattern.findall(str(value)):
                 secrets.add(match)
 

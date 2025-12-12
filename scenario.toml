@@ -14,5 +14,11 @@ name = "role_2_name"
 image = ""
 env = {}
 
+# Add environments here
+# [[environments]]
+# name = "env_name"
+# image = ""
+# env = {}
+
 [config]
 # Add your assessment config here
