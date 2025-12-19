@@ -26,6 +26,7 @@ A2A_SCENARIO_PATH = "a2a-scenario.toml"
 ENV_PATH = ".env.example"
 
 DEFAULT_PORT = 9009
+DEFAULT_ENV_VARS = {"PYTHONUNBUFFERED": "1"}
 
 COMPOSE_TEMPLATE = """# Auto-generated from scenario.toml
 
@@ -109,14 +110,9 @@ def parse_scenario(scenario_path: Path) -> dict[str, Any]:
     return data
 
 
-def format_env_vars(env_dict: dict) -> str:
-    if not env_dict:
-        return " []"
-
-    lines = []
-    for key, value in env_dict.items():
-        lines.append(f"      - {key}={value}")
-
+def format_env_vars(env_dict: dict[str, Any]) -> str:
+    env_vars = {**DEFAULT_ENV_VARS, **env_dict}
+    lines = [f"      - {key}={value}" for key, value in env_vars.items()]
     return "\n" + "\n".join(lines)
 
 
