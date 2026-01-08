@@ -1,7 +1,8 @@
-"""Record provenance information (image digests and timestamp) for assessment results."""
+"""Record provenance information (image digests, timestamp, and workflow metadata) for assessment results."""
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -50,12 +51,48 @@ def collect_image_digests(compose: dict) -> dict[str, str]:
     return digests
 
 
+def collect_github_actions_metadata() -> dict[str, str] | None:
+    """Collect GitHub Actions run metadata when available."""
+    if not os.environ.get("GITHUB_ACTIONS"):
+        return None
+
+    env = os.environ
+    repository = env.get("GITHUB_REPOSITORY")
+    server_url = env.get("GITHUB_SERVER_URL")
+    api_url = env.get("GITHUB_API_URL")
+    run_id = env.get("GITHUB_RUN_ID")
+    run_url = None
+    repository_url = None
+    if repository and server_url and run_id:
+        run_url = f"{server_url}/{repository}/actions/runs/{run_id}"
+    if repository and server_url:
+        repository_url = f"{server_url}/{repository}"
+    run_logs_url = None
+    if repository and api_url and run_id:
+        run_logs_url = f"{api_url}/repos/{repository}/actions/runs/{run_id}/logs"
+
+    metadata = {
+        "run_url": run_url,
+        "run_logs_url": run_logs_url,
+        "ref": env.get("GITHUB_REF"),
+        "sha": env.get("GITHUB_SHA"),
+        "repository_url": repository_url,
+        "workflow_ref": env.get("GITHUB_WORKFLOW_REF"),
+        "workflow_sha": env.get("GITHUB_WORKFLOW_SHA"),
+    }
+
+    return {key: value for key, value in metadata.items() if value}
+
+
 def write_provenance(output_path: Path, image_digests: dict[str, str]) -> None:
     """Write provenance information to a JSON file."""
     provenance = {
         "image_digests": image_digests,
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     }
+    github_actions = collect_github_actions_metadata()
+    if github_actions:
+        provenance["github_actions"] = github_actions
 
     with open(output_path, "w") as f:
         json.dump(provenance, f, indent=2)
