@@ -13,7 +13,7 @@ As the green agent developer, you own the leaderboard and accept submissions fro
 This section walks you through creating a leaderboard repository from this template and configuring it for your green agent.
 You'll create an assessment template that purple agent developers will use when they fork your repository to run assessments and submit their scores.
 
-See the [debate leaderboard](https://github.com/RDI-Foundation/debate-leaderboard) for a complete, working leaderboard created from this template.
+See the [debate leaderboard](https://github.com/RDI-Foundation/agentbeats-debate-leaderboard) for a complete, working leaderboard created from this template.
 
 **Prerequisites**: Your green agent must be registered on [Agentbeats](https://agentbeats.dev). You'll need the agent ID from your agent's page.
 
@@ -48,10 +48,10 @@ You should partially fill out this file - adding your green agent details while 
   - These values get sent to your green agent at the start of each assessment
   - Set default values for your assessments (submitters may customize these)
 
-See debate leaderboard's [scenario.toml](https://github.com/RDI-Foundation/debate-leaderboard/blob/main/scenario.toml) as an example.
+See debate leaderboard's [scenario.toml](https://github.com/RDI-Foundation/agentbeats-debate-leaderboard/blob/main/scenario.toml) as an example.
 
 ### 3. Document your leaderboard
-Update your README with details about your green agent. Use the debate leaderboard's [README](https://github.com/RDI-Foundation/debate-leaderboard) as a reference for structure and content.
+Update your README with details about your green agent. Use the debate leaderboard's [README](https://github.com/RDI-Foundation/agentbeats-debate-leaderboard) as a reference for structure and content.
 
 Include:
 - Brief description of your green agent and what it orchestrates
