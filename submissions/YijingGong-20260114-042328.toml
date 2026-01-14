@@ -1,0 +1,10 @@
+[green_agent]
+agentbeats_id = "019bb980-5383-7131-9b41-e867b16ed71f"
+env = {}
+
+[[participants]]
+agentbeats_id = "019bb9c9-b3d6-73f0-a5b1-fe92b58db7f0"
+name = "participant"
+env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }
+
+[config]
