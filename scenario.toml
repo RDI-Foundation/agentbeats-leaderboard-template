@@ -4,7 +4,7 @@ env = {}
 
 [[participants]]
 agentbeats_id = "019bb9c9-b3d6-73f0-a5b1-fe92b58db7f0"
-name = "Dairy-paper-extractor"
+name = "Dairy-paper-extractor-2"
 env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }
 
 [config]
