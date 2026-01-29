@@ -1,0 +1,94 @@
+{
+  "participants": {
+    "participant": "019bb9c9-b3d6-73f0-a5b1-fe92b58db7f0"
+  },
+  "results": [
+    {
+      "overall_score": 0.3903004278739293,
+      "mean_equation_match_percentage": 0.0,
+      "mean_bertscore_f1": 0.7806008557478586,
+      "total_papers": 6,
+      "successful_evaluations": 6,
+      "papers": [
+        {
+          "paper_id": "001",
+          "evaluation": {
+            "equation_match_percentage": 0.0,
+            "bertscore": {
+              "precision": 0.801612138748169,
+              "recall": 0.7571160793304443,
+              "f1": 0.7787290215492249
+            },
+            "error": null
+          },
+          "error": null
+        },
+        {
+          "paper_id": "002",
+          "evaluation": {
+            "equation_match_percentage": 0.0,
+            "bertscore": {
+              "precision": 0.7963897585868835,
+              "recall": 0.7601945996284485,
+              "f1": 0.777871310710907
+            },
+            "error": null
+          },
+          "error": null
+        },
+        {
+          "paper_id": "003",
+          "evaluation": {
+            "equation_match_percentage": 0.0,
+            "bertscore": {
+              "precision": 0.8033643364906311,
+              "recall": 0.7615883350372314,
+              "f1": 0.7819187641143799
+            },
+            "error": null
+          },
+          "error": null
+        },
+        {
+          "paper_id": "004",
+          "evaluation": {
+            "equation_match_percentage": 0.0,
+            "bertscore": {
+              "precision": 0.803159773349762,
+              "recall": 0.7611021995544434,
+              "f1": 0.7815656661987305
+            },
+            "error": null
+          },
+          "error": null
+        },
+        {
+          "paper_id": "005",
+          "evaluation": {
+            "equation_match_percentage": 0.0,
+            "bertscore": {
+              "precision": 0.8016449809074402,
+              "recall": 0.7645877599716187,
+              "f1": 0.782677948474884
+            },
+            "error": null
+          },
+          "error": null
+        },
+        {
+          "paper_id": "006",
+          "evaluation": {
+            "equation_match_percentage": 0.0,
+            "bertscore": {
+              "precision": 0.8019246459007263,
+              "recall": 0.7608403563499451,
+              "f1": 0.7808424234390259
+            },
+            "error": null
+          },
+          "error": null
+        }
+      ]
+    }
+  ]
+}
