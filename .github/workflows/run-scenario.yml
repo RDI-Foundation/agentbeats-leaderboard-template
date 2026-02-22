@@ -26,7 +26,6 @@ jobs:
         with:
           ref: ${{ github.head_ref }}
 
-      # ── Resolve submission ID from branch name ──────────────────
       - name: Resolve submission ID
         id: submission
         shell: bash
@@ -40,7 +39,6 @@ jobs:
           echo "Unable to derive submission ID from branch: $ref_name" >&2
           exit 1
 
-      # ── Find scenario file ───────────────────────────────────────
       - name: Find scenario file
         id: scenario
         shell: bash
@@ -57,7 +55,6 @@ jobs:
           echo "path=$scenario" >> "$GITHUB_OUTPUT"
           echo "base=$base" >> "$GITHUB_OUTPUT"
 
-      # ── Fetch OIDC token ────────────────────────────────────────
       - name: Fetch GitHub OIDC token
         id: oidc
         shell: bash
@@ -73,7 +70,6 @@ jobs:
           echo "::add-mask::$oidc_token"
           echo "token=$oidc_token" >> "$GITHUB_OUTPUT"
 
-      # ── Fetch encrypted secrets from AgentBeats ─────────────────
       - name: Fetch secrets bundle
         id: bundle
         shell: bash
@@ -95,7 +91,6 @@ jobs:
           echo "iv_b64=$(jq -r '.metadata.iv' secrets_response.json)" >> "$GITHUB_OUTPUT"
           echo "key_id=$(jq -r '.metadata.key_id' secrets_response.json)" >> "$GITHUB_OUTPUT"
 
-      # ── GCP auth + KMS unwrap ───────────────────────────────────
       - name: Authenticate to GCP
         id: gcp-auth
         uses: google-github-actions/auth@v2
@@ -126,7 +121,6 @@ jobs:
           echo "::add-mask::$dek_b64"
           echo "dek_b64=$dek_b64" >> "$GITHUB_OUTPUT"
 
-      # ── Decrypt secrets and export as env vars ──────────────────
       - name: Decrypt and export secrets
         shell: bash
         env:
@@ -175,7 +169,6 @@ jobs:
           console.log(`Exported secrets for ${(secrets.participants || []).length} participants`);
           NODE
 
-      # ── Compile amber scenario ──────────────────────────────────
       - name: Compile scenario
         run: |
           docker run --rm --user "$(id -u):$(id -g)" \
@@ -185,7 +178,6 @@ jobs:
               --output /work/scenario-ir.json \
               --compose /work/docker-compose.yml
 
-      # ── Run scenario ────────────────────────────────────────────
       - name: Run scenario
         run: docker compose up -d
 
@@ -215,10 +207,9 @@ jobs:
         if: always()
         run: docker compose down
 
-      # ── Post-processing ─────────────────────────────────────────
       - name: Add participants to results
         run: |
-          participants=$(jq '[.components[] | select(.metadata.agentbeats_id) | {(.moniker | ltrimstr("/")): .metadata.agentbeats_id}] | add // {}' scenario-ir.json)
+          participants=$(jq '.metadata.agentbeats_ids // {}' "${{ steps.scenario.outputs.path }}")
           jq --argjson participants "$participants" '. + {participants: $participants}' results.json > results-final.json
           mv results-final.json results.json
 
@@ -254,7 +245,6 @@ jobs:
               }
             }' > provenance.json
 
-      # ── Commit results back to branch ─────────────────────────
       - name: Commit results
         env:
           BASE: ${{ steps.scenario.outputs.base }}
@@ -268,9 +258,8 @@ jobs:
           git commit -m "[AgentBeats] Scenario results"
           git push
 
-      # ── Clean up secrets ─────────────────────────────────────
       - name: Delete secrets from backend
-        if: always() && steps.submission.outputs.submission_id
+        if: success()
         shell: bash
         env:
           BACKEND_URL: ${{ env.AGENTBEATS_URL }}
