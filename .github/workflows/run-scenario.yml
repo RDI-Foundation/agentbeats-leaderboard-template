@@ -2,6 +2,7 @@ name: Run Scenario
 
 on:
   push:
+    branches: ['**']
     paths:
       - 'scenario.toml'
 
