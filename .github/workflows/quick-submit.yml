@@ -8,7 +8,7 @@ on:
 jobs:
   run-scenario:
     if: startsWith(github.head_ref, 'quick-submit-')
-    uses: RDI-Foundation/agentbeats-leaderboard-template/.github/workflows/run-scenario.yml@staverm/amber-runner
+    uses: RDI-Foundation/agentbeats-leaderboard-template/.github/workflows/quick-submit-runner.yml@v1
     permissions:
       id-token: write
       contents: write

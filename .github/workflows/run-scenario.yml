@@ -1,277 +1,127 @@
-# Reusable workflow
-# 1. fetch + decrypt quick-submit secrets from AgentBeats,
-# 2. compile and run the amber scenario
-# 3. commit results
-
-name: Quick-Submit Amber Runner
+name: Run Scenario
 
 on:
-  workflow_call:
+  push:
+    paths:
+      - 'scenario.toml'
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    if: github.event.repository.fork == true || github.ref != 'refs/heads/main'
     permissions:
-      id-token: write
       contents: write
-
-    env:
-      AGENTBEATS_URL: ${{ vars.QUICK_SUBMIT_BACKEND_URL || 'https://agentbeats.dev' }}
-      OIDC_AUDIENCE: ${{ vars.QUICK_SUBMIT_OIDC_AUDIENCE || 'agentbeats-quick-submit-dev' }}
-      GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER || 'projects/352582078246/locations/global/workloadIdentityPools/agentbeats-dev/providers/github' }}
-      GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT || 'agentbeats-dev-quick-submit@komyo-agentbeats.iam.gserviceaccount.com' }}
+      packages: read
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
-          ref: ${{ github.head_ref }}
+          python-version: '3.11'
 
-      - name: Resolve submission ID
-        id: submission
-        shell: bash
-        run: |
-          set -euo pipefail
-          ref_name="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-}}"
-          if [[ "$ref_name" =~ ^quick-submit-([0-9a-fA-F-]{36})$ ]]; then
-            echo "submission_id=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "Unable to derive submission ID from branch: $ref_name" >&2
-          exit 1
+      - name: Install dependencies
+        run: pip install tomli tomli-w pyyaml requests
 
-      - name: Find scenario file
-        id: scenario
-        shell: bash
-        env:
-          SUBMISSION_ID: ${{ steps.submission.outputs.submission_id }}
+      - name: Generate docker-compose.yml
+        run: python generate_compose.py --scenario scenario.toml
+
+      - name: Pull images
         run: |
-          set -euo pipefail
-          scenario=$(ls submissions/*"${SUBMISSION_ID}"*.json 2>/dev/null | grep -v provenance | head -1)
-          if [[ -z "$scenario" ]]; then
-            echo "No scenario file found for submission ${SUBMISSION_ID}" >&2
+          if ! docker compose pull; then
+            echo ""
+            echo "Error: Failed to pull one or more images."
+            echo "Ensure all images are publicly accessible."
+            echo "For ghcr.io images, check package settings at:"
+            echo "  https://github.com/orgs/YOUR_ORG/packages or"
+            echo "  https://github.com/users/YOUR_USER/packages"
             exit 1
           fi
-          base=$(basename "$scenario" .json)
-          echo "path=$scenario" >> "$GITHUB_OUTPUT"
-          echo "base=$base" >> "$GITHUB_OUTPUT"
 
-      - name: Fetch GitHub OIDC token
-        id: oidc
-        shell: bash
-        run: |
-          set -euo pipefail
-          oidc_response="$(curl -fsS \
-            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}")"
-          oidc_token="$(jq -r '.value' <<<"$oidc_response")"
-          if [[ -z "$oidc_token" || "$oidc_token" == "null" ]]; then
-            echo "Failed to fetch OIDC token" >&2; exit 1
-          fi
-          echo "::add-mask::$oidc_token"
-          echo "token=$oidc_token" >> "$GITHUB_OUTPUT"
+      - name: Create output directory
+        run: mkdir -p output && chmod 777 output
 
-      - name: Fetch secrets bundle
-        id: bundle
-        shell: bash
+      - name: Export secrets as environment variables
         env:
-          BACKEND_URL: ${{ env.AGENTBEATS_URL }}
-          SUBMISSION_ID: ${{ steps.submission.outputs.submission_id }}
-          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+          SECRETS_JSON: ${{ toJSON(secrets) }}
         run: |
-          set -euo pipefail
-          secrets_url="${BACKEND_URL}/api/quick-submit/${SUBMISSION_ID}/secrets"
-          http_code="$(curl -sS -o secrets_response.json -w "%{http_code}" \
-            -H "Authorization: Bearer ${OIDC_TOKEN}" "$secrets_url" || true)"
-          if [[ "$http_code" != "200" ]]; then
-            echo "Backend returned HTTP ${http_code}:" >&2
-            cat secrets_response.json >&2; exit 1
-          fi
-          echo "secrets_blob_b64=$(jq -r '.secrets_blob' secrets_response.json)" >> "$GITHUB_OUTPUT"
-          echo "wrapped_dek_b64=$(jq -r '.wrapped_dek' secrets_response.json)" >> "$GITHUB_OUTPUT"
-          echo "iv_b64=$(jq -r '.metadata.iv' secrets_response.json)" >> "$GITHUB_OUTPUT"
-          echo "key_id=$(jq -r '.metadata.key_id' secrets_response.json)" >> "$GITHUB_OUTPUT"
+          echo "$SECRETS_JSON" | jq -r 'to_entries|map("\(.key)=\(.value)")|.[]' > .env
 
-      - name: Authenticate to GCP
-        id: gcp-auth
-        uses: google-github-actions/auth@v2
+      - name: Check if GHCR_TOKEN is available
+        id: check_ghcr
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          if [ -n "$GHCR_TOKEN" ]; then
+            echo "has_token=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_token=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Login to GitHub Container Registry
+        if: steps.check_ghcr.outputs.has_token == 'true'
+        uses: docker/login-action@v3
         with:
-          workload_identity_provider: ${{ env.GCP_WIF_PROVIDER }}
-          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
-          token_format: access_token
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
 
-      - name: Unwrap DEK via KMS
-        id: dek
-        shell: bash
+      - name: Run assessment
+        run: docker compose up --timestamps --no-color --exit-code-from agentbeats-client --abort-on-container-exit
+
+      - name: Record provenance
+        run: python record_provenance.py --compose docker-compose.yml --output output/provenance.json
+
+      - name: Generate submission metadata
+        id: metadata
+        run: |
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          USERNAME=${{ github.repository_owner }}
+          UNIQUE_NAME="${USERNAME}-${TIMESTAMP}"
+          echo "unique_name=$UNIQUE_NAME" >> $GITHUB_OUTPUT
+          echo "branch_name=submission-${UNIQUE_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Copy files to submission directory
+        run: |
+          cp scenario.toml submissions/${{ steps.metadata.outputs.unique_name }}.toml
+          cp output/results.json results/${{ steps.metadata.outputs.unique_name }}.json
+          cp output/provenance.json submissions/${{ steps.metadata.outputs.unique_name }}.provenance.json
+
+      - name: Determine target repository
+        id: target
         env:
-          GCP_ACCESS_TOKEN: ${{ steps.gcp-auth.outputs.access_token }}
-          KMS_KEY_ID: ${{ steps.bundle.outputs.key_id }}
-          WRAPPED_DEK_B64: ${{ steps.bundle.outputs.wrapped_dek_b64 }}
+            GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          kms_url="https://cloudkms.googleapis.com/v1/${KMS_KEY_ID}:asymmetricDecrypt"
-          http_code="$(curl -sS -o kms_response.json -w "%{http_code}" \
-            -H "Authorization: Bearer ${GCP_ACCESS_TOKEN}" \
-            -H 'Content-Type: application/json' \
-            -d "{\"ciphertext\":\"${WRAPPED_DEK_B64}\"}" "$kms_url" || true)"
-          if [[ "$http_code" != "200" ]]; then
-            echo "KMS returned HTTP ${http_code}:" >&2
-            cat kms_response.json >&2; exit 1
-          fi
-          dek_b64="$(jq -r '.plaintext' kms_response.json)"
-          echo "::add-mask::$dek_b64"
-          echo "dek_b64=$dek_b64" >> "$GITHUB_OUTPUT"
+            PARENT_REPO=$(gh api repos/${{ github.repository }} --jq '.parent.full_name // "${{ github.repository }}"')
+            echo "Target repository: $PARENT_REPO"
+            echo "repo=$PARENT_REPO" >> $GITHUB_OUTPUT
 
-      - name: Decrypt and export secrets
-        shell: bash
-        env:
-          DEK_B64: ${{ steps.dek.outputs.dek_b64 }}
-          IV_B64: ${{ steps.bundle.outputs.iv_b64 }}
-          CIPHERTEXT_B64: ${{ steps.bundle.outputs.secrets_blob_b64 }}
+      - name: Create submission branch
         run: |
-          set -euo pipefail
-          node - <<'NODE'
-          const crypto = require('crypto');
-
-          const dek = Buffer.from(process.env.DEK_B64, 'base64');
-          const iv = Buffer.from(process.env.IV_B64, 'base64');
-          const ciphertextAndTag = Buffer.from(process.env.CIPHERTEXT_B64, 'base64');
-
-          const tag = ciphertextAndTag.subarray(ciphertextAndTag.length - 16);
-          const ciphertext = ciphertextAndTag.subarray(0, ciphertextAndTag.length - 16);
-
-          const decipher = crypto.createDecipheriv('aes-256-gcm', dek, iv);
-          decipher.setAuthTag(tag);
-          const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-
-          const secrets = JSON.parse(plaintext.toString('utf8'));
-
-          // Export all secrets as env vars (green + participant secrets)
-          const fs = require('fs');
-          const envFile = process.env.GITHUB_ENV;
-
-          function exportSecret(key, value) {
-            console.log(`::add-mask::${value}`);
-            fs.appendFileSync(envFile, `${key}=${value}\n`);
-          }
-
-          // Green agent secrets
-          for (const [key, value] of Object.entries(secrets.green || {})) {
-            exportSecret(key, value);
-          }
-          // Participant secrets (namespaced by participant name)
-          for (const participant of secrets.participants || []) {
-            for (const [key, value] of Object.entries(participant.secrets || {})) {
-              exportSecret(key, value);
-            }
-          }
-
-          console.log(`Exported ${Object.keys(secrets.green || {}).length} green secrets`);
-          console.log(`Exported secrets for ${(secrets.participants || []).length} participants`);
-          NODE
-
-      - name: Compile scenario
-        run: |
-          docker run --rm --user "$(id -u):$(id -g)" \
-            -v "${{ github.workspace }}:/work" \
-            ghcr.io/rdi-foundation/amber-cli:main \
-            compile "/work/${{ steps.scenario.outputs.path }}" \
-              --output /work/scenario-ir.json \
-              --compose /work/docker-compose.yml
-
-      - name: Run scenario
-        run: docker compose up -d
-
-      - name: Poll for results
-        run: |
-          docker compose logs -f &
-          if ! yq -e '.x-amber.exports.results' docker-compose.yml > /dev/null 2>&1; then
-            echo "Error: scenario must have an export named 'results'" >&2
-            exit 1
-          fi
-          poll_host=$(yq '.x-amber.exports.results.published_host' docker-compose.yml)
-          poll_port=$(yq '.x-amber.exports.results.published_port' docker-compose.yml)
-          poll_url="http://${poll_host}:${poll_port}"
-          echo "Polling ${poll_url}..."
-          while true; do
-            response=$(curl -sf "${poll_url}") || { sleep 5; continue; }
-            status=$(echo "${response}" | jq -r '.status')
-            if [ "${status}" != "running" ]; then
-              echo "${response}" | jq . > results.json
-              echo "Scenario finished with status: ${status}"
-              break
-            fi
-            sleep 5
-          done
-
-      - name: Stop scenario
-        if: always()
-        run: docker compose down
-
-      - name: Add participants to results
-        run: |
-          participants=$(jq '.metadata.agentbeats_ids // {}' "${{ steps.scenario.outputs.path }}")
-          jq --argjson participants "$participants" '. + {participants: $participants}' results.json > results-final.json
-          mv results-final.json results.json
-
-      - name: Generate provenance
-        run: |
-          image_digests=$(jq -r '.components[] | select(.program) | "\(.moniker)=\(.program.image)"' scenario-ir.json | while IFS='=' read -r name image; do
-            digest=$(docker image inspect "$image" --format '{{index .RepoDigests 0}}')
-            printf '%s\t%s\n' "$name" "$digest"
-          done | jq -Rn '[inputs | split("\t") | {(.[0]): .[1]}] | add // {}')
-          timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          manifest_digests=$(jq '[.components[] | {(.moniker): .digest}] | add // {}' scenario-ir.json)
-          jq -n \
-            --argjson image_digests "$image_digests" \
-            --argjson manifest_digests "$manifest_digests" \
-            --arg timestamp "$timestamp" \
-            --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            --arg ref "${{ github.ref }}" \
-            --arg sha "${{ github.sha }}" \
-            --arg repository_url "${{ github.server_url }}/${{ github.repository }}" \
-            --arg workflow_ref "${{ github.workflow_ref }}" \
-            --arg workflow_sha "${{ github.workflow_sha }}" \
-            '{
-              image_digests: $image_digests,
-              manifest_digests: $manifest_digests,
-              timestamp: $timestamp,
-              github_actions: {
-                run_url: $run_url,
-                ref: $ref,
-                sha: $sha,
-                repository_url: $repository_url,
-                workflow_ref: $workflow_ref,
-                workflow_sha: $workflow_sha
-              }
-            }' > provenance.json
+          git remote add upstream https://github.com/${{ steps.target.outputs.repo }}.git
+          git fetch upstream
+          git checkout -b ${{ steps.metadata.outputs.branch_name }} upstream/main
 
       - name: Commit results
-        env:
-          BASE: ${{ steps.scenario.outputs.base }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          mkdir -p results
-          mv results.json "results/${BASE}.json"
-          mv provenance.json "submissions/${BASE}-provenance.json"
-          git add "results/${BASE}.json" "submissions/${BASE}-provenance.json"
-          git commit -m "[AgentBeats] Scenario results"
-          git push
+          git add submissions/${{ steps.metadata.outputs.unique_name }}.toml submissions/${{ steps.metadata.outputs.unique_name }}.provenance.json results/${{ steps.metadata.outputs.unique_name }}.json
+          git commit -m "Submission: ${{ steps.metadata.outputs.unique_name }}
 
-      - name: Delete secrets from backend
-        if: success()
-        shell: bash
-        env:
-          BACKEND_URL: ${{ env.AGENTBEATS_URL }}
-          SUBMISSION_ID: ${{ steps.submission.outputs.submission_id }}
-          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+          Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          git push origin ${{ steps.metadata.outputs.branch_name }}
+          echo "::notice title=Submission Branch Created::Your results are ready for submission on branch: ${{ steps.metadata.outputs.branch_name }}"
+
+      - name: Output PR link
         run: |
-          set -euo pipefail
-          http_code="$(curl -sS -o /dev/null -w "%{http_code}" -X POST \
-            -H "Authorization: Bearer ${OIDC_TOKEN}" \
-            "${BACKEND_URL}/api/quick-submit/${SUBMISSION_ID}/complete" || true)"
-          if [[ "$http_code" == "200" ]]; then
-            echo "Secrets deleted successfully"
-          else
-            echo "Warning: secrets cleanup returned HTTP ${http_code} (non-fatal)" >&2
-          fi
+          echo "### Submit your results" >> $GITHUB_STEP_SUMMARY
+          echo "[Click here to open a pull request](https://github.com/${{ steps.target.outputs.repo }}/compare/main...${{ github.repository_owner }}:${{ github.event.repository.name }}:${{ steps.metadata.outputs.branch_name }}?expand=1)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ When creating the PR, UNCHECK 'Allow edits and access to secrets by maintainers' to protect your secrets." >> $GITHUB_STEP_SUMMARY
+
+      - name: Cleanup
+        if: always()
+        run: docker compose down -v || true
