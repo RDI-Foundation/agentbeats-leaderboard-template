@@ -1,8 +1,6 @@
 # Reusable workflow - called from leaderboard repos via quick-submit.yml (@v1).
-# 1. fetch + decrypt quick-submit secrets from AgentBeats
-# 2. compile and run the amber scenario
-# 3. commit results
-# After merging changes, move the tag: git tag -f v1 && git push origin v1 --force
+# After making changes, move the tag so leaderboard repos using @v1 pick up the update:
+#   git tag -f v1 && git push origin v1 --force
 
 name: Quick-Submit Amber Runner
 
