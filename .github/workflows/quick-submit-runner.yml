@@ -154,11 +154,12 @@ jobs:
           }
 
           for (const [key, value] of Object.entries(secrets.green || {})) {
-            exportSecret(key, value);
+            exportSecret(`GREEN_${key}`, value);
           }
           for (const participant of secrets.participants || []) {
+            const prefix = participant.name.toUpperCase();
             for (const [key, value] of Object.entries(participant.secrets || {})) {
-              exportSecret(key, value);
+              exportSecret(`${prefix}_${key}`, value);
             }
           }
 
