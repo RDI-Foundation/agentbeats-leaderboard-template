@@ -177,10 +177,8 @@ jobs:
               --compose /work/docker-compose.yml
 
       - name: Run scenario
-        run: docker compose up -d
-
-      - name: Poll for results
         run: |
+          docker compose up -d
           docker compose logs -f &
           if ! yq -e '.x-amber.exports.results' docker-compose.yml > /dev/null 2>&1; then
             echo "Error: scenario must have an export named 'results'" >&2
@@ -200,6 +198,9 @@ jobs:
             fi
             sleep 5
           done
+          if [ "${status}" != "completed" ]; then
+            exit 1
+          fi
 
       - name: Stop scenario
         if: always()
