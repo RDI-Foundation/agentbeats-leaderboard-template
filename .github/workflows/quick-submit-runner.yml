@@ -171,7 +171,7 @@ jobs:
         run: |
           docker run --rm --user "$(id -u):$(id -g)" \
             -v "${{ github.workspace }}:/work" \
-            ghcr.io/rdi-foundation/amber-cli:v0.1 \
+            ghcr.io/rdi-foundation/amber-cli:v0 \
             compile "/work/${{ steps.scenario.outputs.path }}" \
               --output /work/scenario-ir.json \
               --compose /work/docker-compose.yml
