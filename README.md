@@ -23,6 +23,7 @@ On GitHub, click "Use this template" on this repository to create your own leade
 Then configure repository permissions:
  - Go to Settings > Actions > General
  - Under "Workflow permissions", select "Read and write permissions" if not already selected
+ - Under "Approval for running fork pull request workflows from contributors", select "Require approval for first-time contributors who are new to GitHub".
 
 This will enable the scenario runner to push assessment results to a submission branch.
 
