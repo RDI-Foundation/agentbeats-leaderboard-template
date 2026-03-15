@@ -19,6 +19,10 @@ jobs:
       OIDC_AUDIENCE: ${{ vars.QUICK_SUBMIT_OIDC_AUDIENCE || 'agentbeats-quick-submit-production' }}
       GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER || 'projects/352582078246/locations/global/workloadIdentityPools/agentbeats-dev/providers/github' }}
       GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT || 'agentbeats-dev-quick-submit@komyo-agentbeats.iam.gserviceaccount.com' }}
+      AMBER_IMAGE: ghcr.io/rdi-foundation/amber-cli:v0.3
+      AMBER_COMPOSE_DIR: amber-compose
+      AMBER_COMPOSE_PROJECT: amber-quick-submit-${{ github.run_id }}-${{ github.run_attempt }}
+      AMBER_PROXY_PORT: "18080"
 
     steps:
       - uses: actions/checkout@v4
@@ -167,44 +171,123 @@ jobs:
           console.log(`Exported secrets for ${(secrets.participants || []).length} participants`);
           NODE
 
-      - name: Compile scenario
+      - name: Install Amber CLI
+        shell: bash
         run: |
-          docker run --rm --user "$(id -u):$(id -g)" \
-            -v "${{ github.workspace }}:/work" \
-            ghcr.io/rdi-foundation/amber-cli:v0 \
-            compile "/work/${{ steps.scenario.outputs.path }}" \
-              --output /work/scenario-ir.json \
-              --compose /work/docker-compose.yml
+          set -euo pipefail
+          docker pull "${AMBER_IMAGE}"
+          cid="$(docker create "${AMBER_IMAGE}")"
+          cleanup() {
+            docker rm "${cid}" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          install -d "${RUNNER_TEMP}/bin"
+          docker cp "${cid}:/amber" "${RUNNER_TEMP}/bin/amber"
+          chmod +x "${RUNNER_TEMP}/bin/amber"
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+          "${RUNNER_TEMP}/bin/amber" --help >/dev/null
 
-      - name: Run scenario
+      - name: Compile scenario
+        shell: bash
         run: |
-          docker compose up -d
-          docker compose logs -f &
-          if ! yq -e '.x-amber.exports.results' docker-compose.yml > /dev/null 2>&1; then
-            echo "Error: scenario must have an export named 'results'" >&2
+          set -euo pipefail
+          rm -rf "${AMBER_COMPOSE_DIR}"
+          amber compile "${{ steps.scenario.outputs.path }}" \
+            --output scenario-ir.json \
+            --docker-compose "${AMBER_COMPOSE_DIR}"
+          if ! jq -e '.exports[] | select(.name == "results" and .capability.kind == "http")' scenario-ir.json > /dev/null; then
+            echo "Scenario must export an HTTP capability named 'results'" >&2
             exit 1
           fi
-          poll_host=$(yq '.x-amber.exports.results.published_host' docker-compose.yml)
-          poll_port=$(yq '.x-amber.exports.results.published_port' docker-compose.yml)
-          poll_url="http://${poll_host}:${poll_port}"
+          if jq -e '.. | objects | select(.kind? == "docker")' scenario-ir.json > /dev/null; then
+            if [[ ! -S /var/run/docker.sock ]]; then
+              echo "Scenario uses framework.docker but /var/run/docker.sock is unavailable" >&2
+              exit 1
+            fi
+            echo "Scenario uses framework.docker; exporting /var/run/docker.sock to Docker Compose"
+            echo "AMBER_DOCKER_SOCK=/var/run/docker.sock" >> "${GITHUB_ENV}"
+          else
+            echo "Scenario does not use framework.docker"
+          fi
+
+      - name: Run scenario
+        shell: bash
+        run: |
+          set -euo pipefail
+          compose=(docker compose -f "${AMBER_COMPOSE_DIR}/compose.yaml" -p "${AMBER_COMPOSE_PROJECT}")
+          proxy_pid=""
+          logs_pid=""
+          cleanup() {
+            exit_code=$?
+            if [[ -n "${proxy_pid}" ]]; then
+              kill "${proxy_pid}" >/dev/null 2>&1 || true
+              wait "${proxy_pid}" >/dev/null 2>&1 || true
+            fi
+            if [[ -n "${logs_pid}" ]]; then
+              kill "${logs_pid}" >/dev/null 2>&1 || true
+              wait "${logs_pid}" >/dev/null 2>&1 || true
+            fi
+            if [[ ${exit_code} -ne 0 ]]; then
+              echo "Amber proxy log:" >&2
+              [[ -f amber-proxy.log ]] && cat amber-proxy.log >&2 || true
+              echo "Compose status:" >&2
+              "${compose[@]}" ps >&2 || true
+            fi
+            exit "${exit_code}"
+          }
+          trap cleanup EXIT
+
+          "${compose[@]}" up -d
+          "${compose[@]}" logs -f --no-color &
+          logs_pid=$!
+
+          amber proxy "${AMBER_COMPOSE_DIR}" \
+            --project-name "${AMBER_COMPOSE_PROJECT}" \
+            --export "results=127.0.0.1:${AMBER_PROXY_PORT}" > amber-proxy.log 2>&1 &
+          proxy_pid=$!
+
+          poll_url="http://127.0.0.1:${AMBER_PROXY_PORT}/"
           echo "Polling ${poll_url}..."
-          while true; do
-            response=$(curl -sf "${poll_url}") || { sleep 5; continue; }
-            status=$(echo "${response}" | jq -r '.status')
-            if [ "${status}" != "running" ]; then
-              echo "${response}" | jq . > results.json
+          status=""
+          deadline=$((SECONDS + 1800))
+          while (( SECONDS < deadline )); do
+            if ! kill -0 "${proxy_pid}" >/dev/null 2>&1; then
+              echo "amber proxy exited unexpectedly" >&2
+              exit 1
+            fi
+            response="$(curl -fsS "${poll_url}" || true)"
+            if [[ -z "${response}" ]]; then
+              sleep 5
+              continue
+            fi
+            status="$(jq -r '.status // empty' <<<"${response}")"
+            if [[ -z "${status}" ]]; then
+              echo "Unexpected results payload:" >&2
+              echo "${response}" >&2
+              sleep 5
+              continue
+            fi
+            if [[ "${status}" != "running" ]]; then
+              jq . <<<"${response}" > results.json
               echo "Scenario finished with status: ${status}"
               break
             fi
             sleep 5
           done
-          if [ "${status}" != "completed" ]; then
+          if [[ ! -f results.json ]]; then
+            echo "Timed out waiting for scenario results" >&2
+            exit 1
+          fi
+          if [[ "${status}" != "completed" ]]; then
             exit 1
           fi
 
       - name: Stop scenario
         if: always()
-        run: docker compose down
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f "${AMBER_COMPOSE_DIR}/compose.yaml" -p "${AMBER_COMPOSE_PROJECT}" down -v --remove-orphans
 
       - name: Add participants to results
         run: |
