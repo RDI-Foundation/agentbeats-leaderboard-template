@@ -19,6 +19,7 @@ jobs:
       OIDC_AUDIENCE: ${{ vars.QUICK_SUBMIT_OIDC_AUDIENCE || 'agentbeats-quick-submit-production' }}
       GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER || 'projects/352582078246/locations/global/workloadIdentityPools/agentbeats-dev/providers/github' }}
       GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT || 'agentbeats-dev-quick-submit@komyo-agentbeats.iam.gserviceaccount.com' }}
+      RESULTS_TIMEOUT_MINUTES: ${{ vars.QUICK_SUBMIT_TIMEOUT_MINUTES || '30' }}
       AMBER_IMAGE: ghcr.io/rdi-foundation/amber-cli:v0.3
       AMBER_COMPOSE_DIR: amber-compose
       AMBER_COMPOSE_PROJECT: amber-quick-submit-${{ github.run_id }}-${{ github.run_attempt }}
@@ -249,7 +250,7 @@ jobs:
           poll_url="http://127.0.0.1:${AMBER_PROXY_PORT}/"
           echo "Polling ${poll_url}..."
           status=""
-          deadline=$((SECONDS + 1800))
+          deadline=$((SECONDS + (60 * RESULTS_TIMEOUT_MINUTES)))
           while (( SECONDS < deadline )); do
             if ! kill -0 "${proxy_pid}" >/dev/null 2>&1; then
               echo "amber proxy exited unexpectedly" >&2
@@ -275,7 +276,7 @@ jobs:
             sleep 5
           done
           if [[ ! -f results.json ]]; then
-            echo "Timed out waiting for scenario results" >&2
+            echo "Timed out waiting ${RESULTS_TIMEOUT_MINUTES} minutes for scenario results" >&2
             exit 1
           fi
           if [[ "${status}" != "completed" ]]; then
