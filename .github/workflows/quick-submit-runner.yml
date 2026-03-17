@@ -17,8 +17,8 @@ jobs:
     env:
       AGENTBEATS_URL: ${{ vars.QUICK_SUBMIT_BACKEND_URL || 'https://agentbeats.dev' }}
       OIDC_AUDIENCE: ${{ vars.QUICK_SUBMIT_OIDC_AUDIENCE || 'agentbeats-quick-submit-production' }}
-      GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER || 'projects/352582078246/locations/global/workloadIdentityPools/agentbeats-dev/providers/github' }}
-      GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT || 'agentbeats-dev-quick-submit@komyo-agentbeats.iam.gserviceaccount.com' }}
+      GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER || 'projects/352582078246/locations/global/workloadIdentityPools/agentbeats-prod/providers/github' }}
+      GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT || 'agentbeats-prod-quick-submit@komyo-agentbeats.iam.gserviceaccount.com' }}
 
     steps:
       - uses: actions/checkout@v4
