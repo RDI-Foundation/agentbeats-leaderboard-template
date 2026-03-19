@@ -109,6 +109,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git rm -r --cached .github/workflows/ 2>/dev/null || true
           git add submissions/${{ steps.metadata.outputs.unique_name }}.toml submissions/${{ steps.metadata.outputs.unique_name }}.provenance.json results/${{ steps.metadata.outputs.unique_name }}.json
           git commit -m "Submission: ${{ steps.metadata.outputs.unique_name }}
 
