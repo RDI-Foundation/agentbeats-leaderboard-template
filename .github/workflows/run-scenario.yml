@@ -24,7 +24,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install tomli tomli-w pyyaml requests
+        run: pip install tomli tomli-w pyyaml requests json5
 
       - name: Generate docker-compose.yml
         run: python generate_compose.py --scenario scenario.toml

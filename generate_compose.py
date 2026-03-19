@@ -130,7 +130,38 @@ def resolve_image(agent: dict, name: str) -> None:
         print(f"Using {name} image: {agent['image']}")
     elif has_id:
         info = fetch_agent_info(agent["agentbeats_id"])
-        agent["image"] = info["docker_image"]
+        docker_image = info.get("docker_image")
+        if not docker_image:
+            amber_url = info.get("amber_manifest_url")
+            if not amber_url:
+                print(f"Error: {name} has no docker_image or amber_manifest_url set on agentbeats.dev")
+                sys.exit(1)
+            try:
+                import json
+                import re as _re
+                resp = requests.get(amber_url, timeout=30)
+                resp.raise_for_status()
+                text = resp.text
+                # Try json5 package first (handles unquoted keys, trailing commas, comments)
+                try:
+                    import json5
+                    manifest = json5.loads(text)
+                except ImportError:
+                    # Fallback: manually convert JSON5 to valid JSON
+                    # Remove line comments
+                    text = _re.sub(r'//[^\n]*', '', text)
+                    # Remove block comments
+                    text = _re.sub(r'/\*.*?\*/', '', text, flags=_re.DOTALL)
+                    # Remove trailing commas before } or ]
+                    text = _re.sub(r',\s*([}\]])', r'\1', text)
+                    # Quote unquoted keys
+                    text = _re.sub(r'(\b\w+\b)\s*:', r'"\1":', text)
+                    manifest = json.loads(text)
+                docker_image = manifest["program"]["image"]
+            except Exception as e:
+                print(f"Error: Failed to resolve image from amber manifest for {name}: {e}")
+                sys.exit(1)
+        agent["image"] = docker_image
         print(f"Resolved {name} image: {agent['image']}")
     else:
         print(f"Error: {name} must have either 'image' or 'agentbeats_id' field")
