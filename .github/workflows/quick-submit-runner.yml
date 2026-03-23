@@ -11,6 +11,10 @@ on:
         description: Agentbeats backend base URL for this quick-submit run
         required: false
         type: string
+    secrets:
+      GREEN_SECRETS_JSON:
+        description: Optional JSON object mapping green config key -> secret value.
+        required: false
 
 jobs:
   run:
@@ -126,6 +130,7 @@ jobs:
           echo "dek_b64=$dek_b64" >> "$GITHUB_OUTPUT"
 
       - name: Decrypt and export secrets
+        id: submitter-secrets
         shell: bash
         env:
           DEK_B64: ${{ steps.dek.outputs.dek_b64 }}
@@ -152,6 +157,7 @@ jobs:
           // Export all secrets as env vars with AMBER_CONFIG_ prefix (green + participant secrets)
           const fs = require('fs');
           const envFile = process.env.GITHUB_ENV;
+          const outputFile = process.env.GITHUB_OUTPUT;
 
           function exportSecret(key, value) {
             console.log(`::add-mask::${value}`);
@@ -168,8 +174,76 @@ jobs:
             }
           }
 
+          const greenKeys = Object.keys(secrets.green || {})
+            .map((key) => key.toLowerCase())
+            .sort();
+          fs.appendFileSync(outputFile, `green_keys_json=${JSON.stringify(greenKeys)}\n`);
+
           console.log(`Exported ${Object.keys(secrets.green || {}).length} green secrets`);
           console.log(`Exported secrets for ${(secrets.participants || []).length} participants`);
+          NODE
+
+      - name: Export repo-owned green secrets
+        shell: bash
+        env:
+          GREEN_SECRETS_JSON: ${{ secrets.GREEN_SECRETS_JSON }}
+          SUBMITTER_GREEN_KEYS_JSON: ${{ steps.submitter-secrets.outputs.green_keys_json }}
+        run: |
+          set -euo pipefail
+          node - <<'NODE'
+          const crypto = require('crypto');
+          const fs = require('fs');
+
+          const raw = process.env.GREEN_SECRETS_JSON?.trim();
+          if (!raw) {
+            console.log('No repo-owned green secrets configured');
+            process.exit(0);
+          }
+
+          let greenSecrets;
+          try {
+            greenSecrets = JSON.parse(raw);
+          } catch (error) {
+            throw new Error(`GREEN_SECRETS_JSON must be valid JSON: ${error.message}`);
+          }
+          if (!greenSecrets || typeof greenSecrets !== 'object' || Array.isArray(greenSecrets)) {
+            throw new Error('GREEN_SECRETS_JSON must be a JSON object');
+          }
+
+          const submitterGreenKeys = new Set(
+            JSON.parse(process.env.SUBMITTER_GREEN_KEYS_JSON || '[]').map((key) =>
+              String(key).toLowerCase()
+            )
+          );
+          const envFile = process.env.GITHUB_ENV;
+          const configKeyPattern = /^[a-z][a-z0-9_]*$/;
+
+          function appendEnv(name, value) {
+            const delimiter = `__AGENTBEATS_${crypto.randomUUID()}__`;
+            fs.appendFileSync(envFile, `${name}<<${delimiter}\n${value}\n${delimiter}\n`);
+          }
+
+          let exportCount = 0;
+          for (const [configKey, value] of Object.entries(greenSecrets)) {
+            if (!configKeyPattern.test(configKey)) {
+              throw new Error(
+                `invalid green config key ${JSON.stringify(configKey)}; expected ^[a-z][a-z0-9_]*$`
+              );
+            }
+            if (typeof value !== 'string') {
+              throw new Error(`GREEN_SECRETS_JSON value for green.${configKey} must be a string`);
+            }
+            if (submitterGreenKeys.has(configKey)) {
+              throw new Error(
+                `repo-owned binding for green.${configKey} collides with a submitter-provided green secret`
+              );
+            }
+            console.log(`::add-mask::${value}`);
+            appendEnv(`AMBER_CONFIG_GREEN_${configKey.toUpperCase()}`, value);
+            exportCount += 1;
+          }
+
+          console.log(`Exported ${exportCount} repo-owned green secrets`);
           NODE
 
       - name: Compile scenario
