@@ -1,43 +1,26 @@
-# Reusable workflow - called from leaderboard repos via quick-submit.yml (@v1).
-# After making changes, move the tag so leaderboard repos using @v1 pick up the update:
-#   git tag -f v1 && git push origin v1 --force
+# Reusable workflow - called from leaderboard repos via quick-submit.yml.
+# After making changes, move the tag so leaderboard repos using @v2 pick up the update:
+#   git tag -f v2 && git push origin v2 --force
 
 name: Quick-Submit Amber Runner
 
 on:
   workflow_call:
-    inputs:
-      backend_url:
-        description: Agentbeats backend base URL for this quick-submit run
-        required: false
-        type: string
-    secrets:
-      GREEN_SECRETS_JSON:
-        description: Optional JSON object mapping green config key -> secret value.
-        required: false
 
 jobs:
-  run:
+  # ── Resolve submission, patch, chunk into batches, extract manifest digests ──
+  setup:
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: write
-
-    env:
-      AGENTBEATS_URL: ${{ inputs.backend_url || vars.QUICK_SUBMIT_BACKEND_URL || 'https://agentbeats.dev' }}
-      OIDC_AUDIENCE: ${{ vars.QUICK_SUBMIT_OIDC_AUDIENCE || 'agentbeats-quick-submit-production' }}
-      GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER || 'projects/352582078246/locations/global/workloadIdentityPools/agentbeats-prod/providers/github' }}
-      GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT || 'agentbeats-prod-quick-submit@komyo-agentbeats.iam.gserviceaccount.com' }}
-      RESULTS_TIMEOUT_MINUTES: ${{ vars.QUICK_SUBMIT_TIMEOUT_MINUTES || '30' }}
-      AMBER_IMAGE: ghcr.io/rdi-foundation/amber-cli:v0.3
-      AMBER_COMPOSE_DIR: amber-compose
-      AMBER_COMPOSE_PROJECT: amber-quick-submit-${{ github.run_id }}-${{ github.run_attempt }}
-      AMBER_PROXY_PORT: "18080"
-
+    outputs:
+      batches: ${{ steps.parse.outputs.batches }}
+      scenario_path: ${{ steps.scenario.outputs.path }}
+      scenario_base: ${{ steps.scenario.outputs.base }}
+      submission_id: ${{ steps.submission.outputs.submission_id }}
+      manifest_digests: ${{ steps.digests.outputs.manifest_digests }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
-          ref: ${{ github.head_ref }}
+          ref: ${{ github.head_ref || github.ref }}
 
       - name: Resolve submission ID
         id: submission
@@ -68,6 +51,176 @@ jobs:
           echo "path=$scenario" >> "$GITHUB_OUTPUT"
           echo "base=$base" >> "$GITHUB_OUTPUT"
 
+      # HACK: Patch submission JSON to manifest v0.3.0 with experimental_features
+      # so amber compile doesn't reject child manifests that declare ["docker"].
+      # Remove once the agentbeats backend generates v0.3.0 submissions natively.
+      - name: Patch submission to manifest v0.3.0
+        shell: bash
+        env:
+          SCENARIO_PATH: ${{ steps.scenario.outputs.path }}
+        run: |
+          set -euo pipefail
+          if [[ "$SCENARIO_PATH" != *.json ]]; then
+            echo "Not a submission JSON ($SCENARIO_PATH); skipping patch"
+            exit 0
+          fi
+          echo "Patching $SCENARIO_PATH → manifest_version 0.3.0 + experimental_features [docker]"
+          jq '.manifest_version = "0.3.0" | .experimental_features = ["docker"]' \
+            "$SCENARIO_PATH" > "${SCENARIO_PATH}.tmp"
+          mv "${SCENARIO_PATH}.tmp" "$SCENARIO_PATH"
+          echo "Patched:"
+          jq '{manifest_version, experimental_features}' "$SCENARIO_PATH"
+
+      # HACK: Rewrite gateway.proxy binding so green talks directly to coding_agent.
+      # The gateway proxy endpoint doesn't serve /.well-known/agent-card.json,
+      # so A2A discovery fails with 404. Direct binding bypasses the proxy.
+      # Remove once the agentbeats backend generates correct bindings.
+      - name: Patch binding — bypass gateway proxy for A2A
+        shell: bash
+        env:
+          SCENARIO_PATH: ${{ steps.scenario.outputs.path }}
+        run: |
+          set -euo pipefail
+          if [[ "$SCENARIO_PATH" != *.json ]]; then
+            echo "Not a submission JSON ($SCENARIO_PATH); skipping patch"
+            exit 0
+          fi
+          if jq -e '.bindings[]? | select(.to == "#green.coding_agent" and .from == "#gateway.proxy")' "$SCENARIO_PATH" > /dev/null 2>&1; then
+            echo "Patching binding: #green.coding_agent ← #gateway.proxy → #coding_agent.a2a"
+            jq '(.bindings[] | select(.to == "#green.coding_agent" and .from == "#gateway.proxy")) |= {to: .to, from: "#coding_agent.a2a"}' \
+              "$SCENARIO_PATH" > "${SCENARIO_PATH}.tmp"
+            mv "${SCENARIO_PATH}.tmp" "$SCENARIO_PATH"
+            echo "Patched bindings:"
+            jq '.bindings' "$SCENARIO_PATH"
+          else
+            echo "No gateway.proxy binding found; skipping"
+          fi
+
+      - name: Extract assessment_config
+        id: assessment_config
+        shell: bash
+        env:
+          SCENARIO_PATH: ${{ steps.scenario.outputs.path }}
+        run: |
+          set -euo pipefail
+          # assessment_config lives in components.gateway.config.assessment_config
+          config=$(jq '.components.gateway.config.assessment_config // {}' "$SCENARIO_PATH")
+          echo "assessment_config: $config"
+
+          max_runners=$(echo "$config" | jq -r '.max_runners // 1')
+          instance_ids=$(echo "$config" | jq -r '(.instance_ids // []) | map(tostring) | join(",")')
+
+          echo "max_runners=${max_runners}" >> "$GITHUB_OUTPUT"
+          echo "instance_ids=${instance_ids}" >> "$GITHUB_OUTPUT"
+
+      - name: Parse instances and chunk into batches
+        id: parse
+        env:
+          MANIFEST_MAX_RUNNERS: ${{ steps.assessment_config.outputs.max_runners }}
+          MANIFEST_INSTANCE_IDS: ${{ steps.assessment_config.outputs.instance_ids }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os
+
+          MAX_RUNNERS = int(os.environ.get("MANIFEST_MAX_RUNNERS", "").strip() or "1")
+          INSTANCE_IDS = os.environ.get("MANIFEST_INSTANCE_IDS", "").strip()
+
+          # Cap runners to number of explicit instance IDs
+          if INSTANCE_IDS:
+              num_ids = len([s.strip() for s in INSTANCE_IDS.split(",") if s.strip()])
+              if num_ids < MAX_RUNNERS:
+                  print(f"Capping max_runners from {MAX_RUNNERS} to {num_ids} (only {num_ids} instance IDs)")
+                  MAX_RUNNERS = num_ids
+
+          batches = [
+              {"id": f"batch-{i:03d}", "index": i, "total": MAX_RUNNERS}
+              for i in range(MAX_RUNNERS)
+          ]
+
+          # Pass instance_ids through if explicitly set (optional override)
+          if INSTANCE_IDS:
+              for b in batches:
+                  b["instance_ids"] = INSTANCE_IDS
+
+          print(f"Config: max_runners={MAX_RUNNERS}")
+          print(f"Instance IDs override: {INSTANCE_IDS[:80] + '...' if len(INSTANCE_IDS) > 80 else INSTANCE_IDS or 'none'}")
+          print(f"Total batches: {len(batches)}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"batches={json.dumps(batches)}\n")
+          PYEOF
+
+      # ── Install amber CLI & extract manifest digests for provenance ──
+      - name: Install amber CLI
+        shell: bash
+        env:
+          AMBER_IMAGE: ghcr.io/rdi-foundation/amber-cli:v0.3
+        run: |
+          set -euo pipefail
+          docker pull "${AMBER_IMAGE}"
+          cid="$(docker create "${AMBER_IMAGE}")"
+          cleanup() { docker rm "${cid}" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          install -d "${RUNNER_TEMP}/bin"
+          docker cp "${cid}:/amber" "${RUNNER_TEMP}/bin/amber"
+          chmod +x "${RUNNER_TEMP}/bin/amber"
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+          "${RUNNER_TEMP}/bin/amber" --help >/dev/null
+
+      - name: Extract manifest digests
+        id: digests
+        shell: bash
+        env:
+          SCENARIO_PATH: ${{ steps.scenario.outputs.path }}
+        run: |
+          set -euo pipefail
+          amber compile "$SCENARIO_PATH" --output scenario-ir.json || true
+          if [[ -f scenario-ir.json ]]; then
+            manifest_digests=$(jq -c '[.components[] | {(.moniker): .digest}] | add // {}' scenario-ir.json)
+          else
+            manifest_digests='{}'
+          fi
+          echo "manifest_digests=${manifest_digests}" >> "$GITHUB_OUTPUT"
+
+  # ── Matrix eval job — one runner per batch ──────────────────────────
+  eval:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      matrix:
+        batch: ${{ fromJSON(needs.setup.outputs.batches) }}
+      fail-fast: false
+
+    permissions:
+      id-token: write
+      contents: write
+
+    env:
+      AGENTBEATS_URL: ${{ vars.QUICK_SUBMIT_BACKEND_URL || 'https://agentbeats.dev' }}
+      OIDC_AUDIENCE: ${{ vars.QUICK_SUBMIT_OIDC_AUDIENCE || 'agentbeats-quick-submit-production' }}
+      GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER || 'projects/352582078246/locations/global/workloadIdentityPools/agentbeats-prod/providers/github' }}
+      GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT || 'agentbeats-prod-quick-submit@komyo-agentbeats.iam.gserviceaccount.com' }}
+      AMBER_IMAGE: ghcr.io/rdi-foundation/amber-cli:v0.3
+      AMBER_COMPOSE_DIR: amber-compose
+      AMBER_COMPOSE_PROJECT: amber-qs-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.batch.id }}
+      AMBER_PROXY_PORT: "18080"
+      RESULTS_TIMEOUT_MINUTES: ${{ vars.QUICK_SUBMIT_TIMEOUT_MINUTES || '30' }}
+
+    steps:
+      - name: Free disk space
+        run: |
+          echo "Before: $(df -h / | tail -1 | awk '{print $4}') free"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/chromium /usr/local/graalvm /opt/hostedtoolcache 2>/dev/null || true
+          sudo docker image prune -af 2>/dev/null || true
+          echo "After: $(df -h / | tail -1 | awk '{print $4}') free"
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.head_ref || github.ref }}
+
+      # ── Secrets (OIDC → backend → GCP KMS → decrypt) ──────────────
       - name: Fetch GitHub OIDC token
         id: oidc
         shell: bash
@@ -88,7 +241,7 @@ jobs:
         shell: bash
         env:
           BACKEND_URL: ${{ env.AGENTBEATS_URL }}
-          SUBMISSION_ID: ${{ steps.submission.outputs.submission_id }}
+          SUBMISSION_ID: ${{ needs.setup.outputs.submission_id }}
           OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
         run: |
           set -euo pipefail
@@ -106,7 +259,7 @@ jobs:
 
       - name: Authenticate to GCP
         id: gcp-auth
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ env.GCP_WIF_PROVIDER }}
           service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
@@ -135,7 +288,6 @@ jobs:
           echo "dek_b64=$dek_b64" >> "$GITHUB_OUTPUT"
 
       - name: Decrypt and export secrets
-        id: submitter-secrets
         shell: bash
         env:
           DEK_B64: ${{ steps.dek.outputs.dek_b64 }}
@@ -162,7 +314,6 @@ jobs:
           // Export all secrets as env vars with AMBER_CONFIG_ prefix (green + participant secrets)
           const fs = require('fs');
           const envFile = process.env.GITHUB_ENV;
-          const outputFile = process.env.GITHUB_OUTPUT;
 
           function exportSecret(key, value) {
             console.log(`::add-mask::${value}`);
@@ -179,87 +330,18 @@ jobs:
             }
           }
 
-          const greenKeys = Object.keys(secrets.green || {})
-            .map((key) => key.toLowerCase())
-            .sort();
-          fs.appendFileSync(outputFile, `green_keys_json=${JSON.stringify(greenKeys)}\n`);
-
           console.log(`Exported ${Object.keys(secrets.green || {}).length} green secrets`);
           console.log(`Exported secrets for ${(secrets.participants || []).length} participants`);
           NODE
 
-      - name: Export repo-owned green secrets
-        shell: bash
-        env:
-          GREEN_SECRETS_JSON: ${{ secrets.GREEN_SECRETS_JSON }}
-          SUBMITTER_GREEN_KEYS_JSON: ${{ steps.submitter-secrets.outputs.green_keys_json }}
-        run: |
-          set -euo pipefail
-          node - <<'NODE'
-          const crypto = require('crypto');
-          const fs = require('fs');
-
-          const raw = process.env.GREEN_SECRETS_JSON?.trim();
-          if (!raw) {
-            console.log('No repo-owned green secrets configured');
-            process.exit(0);
-          }
-
-          let greenSecrets;
-          try {
-            greenSecrets = JSON.parse(raw);
-          } catch (error) {
-            throw new Error(`GREEN_SECRETS_JSON must be valid JSON: ${error.message}`);
-          }
-          if (!greenSecrets || typeof greenSecrets !== 'object' || Array.isArray(greenSecrets)) {
-            throw new Error('GREEN_SECRETS_JSON must be a JSON object');
-          }
-
-          const submitterGreenKeys = new Set(
-            JSON.parse(process.env.SUBMITTER_GREEN_KEYS_JSON || '[]').map((key) =>
-              String(key).toLowerCase()
-            )
-          );
-          const envFile = process.env.GITHUB_ENV;
-          const configKeyPattern = /^[a-z][a-z0-9_]*$/;
-
-          function appendEnv(name, value) {
-            const delimiter = `__AGENTBEATS_${crypto.randomUUID()}__`;
-            fs.appendFileSync(envFile, `${name}<<${delimiter}\n${value}\n${delimiter}\n`);
-          }
-
-          let exportCount = 0;
-          for (const [configKey, value] of Object.entries(greenSecrets)) {
-            if (!configKeyPattern.test(configKey)) {
-              throw new Error(
-                `invalid green config key ${JSON.stringify(configKey)}; expected ^[a-z][a-z0-9_]*$`
-              );
-            }
-            if (typeof value !== 'string') {
-              throw new Error(`GREEN_SECRETS_JSON value for green.${configKey} must be a string`);
-            }
-            if (submitterGreenKeys.has(configKey)) {
-              throw new Error(
-                `repo-owned binding for green.${configKey} collides with a submitter-provided green secret`
-              );
-            }
-            console.log(`::add-mask::${value}`);
-            appendEnv(`AMBER_CONFIG_GREEN_${configKey.toUpperCase()}`, value);
-            exportCount += 1;
-          }
-
-          console.log(`Exported ${exportCount} repo-owned green secrets`);
-          NODE
-
-      - name: Install Amber CLI
+      # ── Install amber CLI ──────────────────────────────────────────
+      - name: Install amber CLI
         shell: bash
         run: |
           set -euo pipefail
           docker pull "${AMBER_IMAGE}"
           cid="$(docker create "${AMBER_IMAGE}")"
-          cleanup() {
-            docker rm "${cid}" >/dev/null 2>&1 || true
-          }
+          cleanup() { docker rm "${cid}" >/dev/null 2>&1 || true; }
           trap cleanup EXIT
           install -d "${RUNNER_TEMP}/bin"
           docker cp "${cid}:/amber" "${RUNNER_TEMP}/bin/amber"
@@ -267,30 +349,104 @@ jobs:
           echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
           "${RUNNER_TEMP}/bin/amber" --help >/dev/null
 
+      # ── Compile Amber scenario ─────────────────────────────────────
+      # HACK: Patches needed again after fresh checkout.
+      - name: Patch submission to manifest v0.3.0
+        shell: bash
+        env:
+          SCENARIO_PATH: ${{ needs.setup.outputs.scenario_path }}
+        run: |
+          set -euo pipefail
+          if [[ "$SCENARIO_PATH" != *.json ]]; then
+            echo "Not a submission JSON ($SCENARIO_PATH); skipping patch"
+            exit 0
+          fi
+          echo "Patching $SCENARIO_PATH → manifest_version 0.3.0 + experimental_features [docker]"
+          jq '.manifest_version = "0.3.0" | .experimental_features = ["docker"]' \
+            "$SCENARIO_PATH" > "${SCENARIO_PATH}.tmp"
+          mv "${SCENARIO_PATH}.tmp" "$SCENARIO_PATH"
+
+      - name: Patch binding — bypass gateway proxy for A2A
+        shell: bash
+        env:
+          SCENARIO_PATH: ${{ needs.setup.outputs.scenario_path }}
+        run: |
+          set -euo pipefail
+          if [[ "$SCENARIO_PATH" != *.json ]]; then
+            echo "Not a submission JSON ($SCENARIO_PATH); skipping patch"
+            exit 0
+          fi
+          if jq -e '.bindings[]? | select(.to == "#green.coding_agent" and .from == "#gateway.proxy")' "$SCENARIO_PATH" > /dev/null 2>&1; then
+            jq '(.bindings[] | select(.to == "#green.coding_agent" and .from == "#gateway.proxy")) |= {to: .to, from: "#coding_agent.a2a"}' \
+              "$SCENARIO_PATH" > "${SCENARIO_PATH}.tmp"
+            mv "${SCENARIO_PATH}.tmp" "$SCENARIO_PATH"
+          fi
+
       - name: Compile scenario
         shell: bash
         run: |
           set -euo pipefail
           rm -rf "${AMBER_COMPOSE_DIR}"
-          amber compile "${{ steps.scenario.outputs.path }}" \
+          amber compile "${{ needs.setup.outputs.scenario_path }}" \
             --output scenario-ir.json \
             --docker-compose "${AMBER_COMPOSE_DIR}"
           if ! jq -e '.exports[] | select(.name == "results" and .capability.kind == "http")' scenario-ir.json > /dev/null; then
             echo "Scenario must export an HTTP capability named 'results'" >&2
             exit 1
           fi
-          if jq -e '.. | objects | select(.kind? == "docker")' scenario-ir.json > /dev/null; then
+          if jq -e '.. | objects | select((.kind? == "docker") or (.kind? == "framework" and .capability? == "docker"))' scenario-ir.json > /dev/null; then
             if [[ ! -S /var/run/docker.sock ]]; then
               echo "Scenario uses framework.docker but /var/run/docker.sock is unavailable" >&2
               exit 1
             fi
-            echo "Scenario uses framework.docker; exporting /var/run/docker.sock to Docker Compose"
-            echo "AMBER_DOCKER_SOCK=/var/run/docker.sock" >> "${GITHUB_ENV}"
+            echo "Scenario uses framework.docker"
+            echo "AMBER_USES_DOCKER=true" >> "${GITHUB_ENV}"
           else
             echo "Scenario does not use framework.docker"
           fi
 
-      - name: Run scenario
+      - name: Verify HelperRunner pattern
+        run: |
+          if grep -q "AMBER_ROOT_CONFIG_SCHEMA_B64" ${AMBER_COMPOSE_DIR}/compose.yaml; then
+            echo "Compose uses HelperRunner pattern"
+          else
+            echo "Compose uses Resolved pattern — secrets won't flow at runtime"
+            exit 1
+          fi
+
+      # ── Export batch config to GITHUB_ENV ──────────────────────────
+      - name: Export batch config
+        run: |
+          set -euo pipefail
+          echo "AMBER_CONFIG_GREEN_BATCH_INDEX=${{ matrix.batch.index }}" >> "${GITHUB_ENV}"
+          echo "AMBER_CONFIG_GREEN_TOTAL_BATCHES=${{ matrix.batch.total }}" >> "${GITHUB_ENV}"
+          instance_ids="${{ matrix.batch.instance_ids }}"
+          if [[ -n "$instance_ids" ]]; then
+            echo "AMBER_CONFIG_GREEN_INSTANCE_IDS=${instance_ids}" >> "${GITHUB_ENV}"
+          fi
+          echo "Batch ${{ matrix.batch.id }}: index=${{ matrix.batch.index }}/${{ matrix.batch.total }}"
+
+      - name: Verify AMBER_CONFIG env vars
+        run: |
+          echo "=== AMBER_CONFIG vars set ==="
+          env | grep ^AMBER_CONFIG_ | sed 's/=.*/=***/' | sort
+          echo "=== Compose env references ==="
+          grep 'AMBER_CONFIG_' "${AMBER_COMPOSE_DIR}/compose.yaml" | head -20
+          missing=0
+          while IFS= read -r var; do
+            var="$(echo "$var" | sed 's/^[[:space:]]*- //' | sed 's/=.*//')"
+            if [[ -z "${!var+x}" ]]; then
+              echo "WARNING: compose expects ${var} but it is NOT set in the environment" >&2
+              missing=$((missing + 1))
+            fi
+          done < <(grep -oP 'AMBER_CONFIG_\S+' "${AMBER_COMPOSE_DIR}/compose.yaml" | sort -u)
+          if (( missing > 0 )); then
+            echo "INFO: ${missing} AMBER_CONFIG var(s) unset (optional keys with 'when:' guards are OK)"
+          fi
+          echo "Required vars verified"
+
+      # ── Run scenario ───────────────────────────────────────────────
+      - name: Run scenario — ${{ matrix.batch.id }}
         shell: bash
         run: |
           set -euo pipefail
@@ -317,6 +473,7 @@ jobs:
           }
           trap cleanup EXIT
 
+          "${compose[@]}" pull --quiet
           "${compose[@]}" up -d
           "${compose[@]}" logs -f --no-color &
           logs_pid=$!
@@ -327,7 +484,7 @@ jobs:
           proxy_pid=$!
 
           poll_url="http://127.0.0.1:${AMBER_PROXY_PORT}/"
-          echo "Polling ${poll_url}..."
+          echo "Polling ${poll_url} for batch ${{ matrix.batch.id }}..."
           status=""
           deadline=$((SECONDS + (60 * RESULTS_TIMEOUT_MINUTES)))
           while (( SECONDS < deadline )); do
@@ -348,44 +505,112 @@ jobs:
               continue
             fi
             if [[ "${status}" != "running" ]]; then
-              jq . <<<"${response}" > results.json
-              echo "Scenario finished with status: ${status}"
+              mkdir -p amber-compose/output
+              jq . <<<"${response}" > amber-compose/output/results.json
+              echo "Batch ${{ matrix.batch.id }} finished with status: ${status}"
               break
             fi
             sleep 5
           done
-          if [[ ! -f results.json ]]; then
-            echo "Timed out waiting ${RESULTS_TIMEOUT_MINUTES} minutes for scenario results" >&2
+          if [[ ! -f amber-compose/output/results.json ]]; then
+            echo "Timed out waiting ${RESULTS_TIMEOUT_MINUTES} minutes for batch results" >&2
             exit 1
           fi
           if [[ "${status}" != "completed" ]]; then
+            echo "Batch failed:" >&2
+            cat amber-compose/output/results.json >&2
             exit 1
           fi
+        timeout-minutes: 300
+
+      - name: Show container logs
+        if: always()
+        run: |
+          compose=(docker compose -f amber-compose/compose.yaml -p "${AMBER_COMPOSE_PROJECT}")
+          for svc in $("${compose[@]}" ps --services 2>/dev/null || true); do
+            echo "=== ${svc} (last 80) ==="
+            "${compose[@]}" logs "${svc}" 2>&1 | tail -80 || true
+          done
 
       - name: Stop scenario
         if: always()
-        shell: bash
+        run: docker compose -f amber-compose/compose.yaml -p "${AMBER_COMPOSE_PROJECT}" down -v --remove-orphans || true
+
+      - name: Upload batch results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: qs-batch-${{ matrix.batch.id }}
+          path: amber-compose/output/results.json
+          retention-days: 30
+
+  # ── Aggregate results across all batches ────────────────────────────
+  summary:
+    needs: [setup, eval]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+    env:
+      AGENTBEATS_URL: ${{ vars.QUICK_SUBMIT_BACKEND_URL || 'https://agentbeats.dev' }}
+      OIDC_AUDIENCE: ${{ vars.QUICK_SUBMIT_OIDC_AUDIENCE || 'agentbeats-quick-submit-production' }}
+      SCENARIO_PATH: ${{ needs.setup.outputs.scenario_path }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.head_ref || github.ref }}
+
+      - name: Download all results
+        uses: actions/download-artifact@v8
+        with:
+          path: results
+          pattern: qs-batch-*
+          merge-multiple: false
+
+      - name: Aggregate results
         run: |
-          set -euo pipefail
-          docker compose -f "${AMBER_COMPOSE_DIR}/compose.yaml" -p "${AMBER_COMPOSE_PROJECT}" down -v --remove-orphans
+          python3 << 'PYEOF'
+          import json, glob
+
+          all_results = []
+          all_statuses = []
+          batch_files = sorted(glob.glob("results/qs-batch-batch-*/results.json"))
+
+          for f in batch_files:
+              with open(f) as fh:
+                  data = json.load(fh)
+              all_results.extend(data.get("results", []))
+              all_statuses.append(data.get("status", "unknown"))
+
+          # Overall status: "completed" only if every batch completed
+          if all(s == "completed" for s in all_statuses):
+              status = "completed"
+          elif any(s == "completed" for s in all_statuses):
+              status = "partial"
+          else:
+              status = "failed"
+
+          with open("results.json", "w") as f:
+              json.dump({"status": status, "results": all_results}, f, indent=2)
+
+          print(f"Aggregated {len(all_results)} results from {len(batch_files)} batches (status: {status})")
+          PYEOF
 
       - name: Add participants to results
         run: |
-          participants=$(jq '.metadata.agentbeats_ids // {}' "${{ steps.scenario.outputs.path }}")
+          participants=$(jq '.metadata.agentbeats_ids // {}' "${SCENARIO_PATH}" 2>/dev/null || echo '{}')
           jq --argjson participants "$participants" '. + {participants: $participants}' results.json > results-final.json
           mv results-final.json results.json
 
       - name: Generate provenance
+        env:
+          MANIFEST_DIGESTS: ${{ needs.setup.outputs.manifest_digests }}
         run: |
-          image_digests=$(jq -r '.components[] | select(.program) | "\(.moniker)=\(.program.image)"' scenario-ir.json | while IFS='=' read -r name image; do
-            digest=$(docker image inspect "$image" --format '{{index .RepoDigests 0}}')
-            printf '%s\t%s\n' "$name" "$digest"
-          done | jq -Rn '[inputs | split("\t") | {(.[0]): .[1]}] | add // {}')
+          set -euo pipefail
           timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          manifest_digests=$(jq '[.components[] | {(.moniker): .digest}] | add // {}' scenario-ir.json)
           jq -n \
-            --argjson image_digests "$image_digests" \
-            --argjson manifest_digests "$manifest_digests" \
+            --argjson manifest_digests "$MANIFEST_DIGESTS" \
             --arg timestamp "$timestamp" \
             --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --arg ref "${{ github.ref }}" \
@@ -394,7 +619,6 @@ jobs:
             --arg workflow_ref "${{ github.workflow_ref }}" \
             --arg workflow_sha "${{ github.workflow_sha }}" \
             '{
-              image_digests: $image_digests,
               manifest_digests: $manifest_digests,
               timestamp: $timestamp,
               github_actions: {
@@ -407,9 +631,18 @@ jobs:
               }
             }' > provenance.json
 
+      - name: Upload aggregate results
+        uses: actions/upload-artifact@v7
+        with:
+          name: qs-aggregate
+          path: |
+            results.json
+            provenance.json
+          retention-days: 30
+
       - name: Commit results
         env:
-          BASE: ${{ steps.scenario.outputs.base }}
+          BASE: ${{ needs.setup.outputs.scenario_base }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -417,15 +650,32 @@ jobs:
           mv results.json "results/${BASE}.json"
           mv provenance.json "submissions/${BASE}-provenance.json"
           git add "results/${BASE}.json" "submissions/${BASE}-provenance.json"
-          git commit -m "[AgentBeats] Scenario results"
+          git commit -m "[AgentBeats] Scenario results" || echo "Nothing to commit"
           git push
+
+      # ── Cleanup: delete secrets from backend ───────────────────────
+      - name: Fetch GitHub OIDC token
+        if: success()
+        id: oidc
+        shell: bash
+        run: |
+          set -euo pipefail
+          oidc_response="$(curl -fsS \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}")"
+          oidc_token="$(jq -r '.value' <<<"$oidc_response")"
+          if [[ -z "$oidc_token" || "$oidc_token" == "null" ]]; then
+            echo "Failed to fetch OIDC token" >&2; exit 1
+          fi
+          echo "::add-mask::$oidc_token"
+          echo "token=$oidc_token" >> "$GITHUB_OUTPUT"
 
       - name: Delete secrets from backend
         if: success()
         shell: bash
         env:
           BACKEND_URL: ${{ env.AGENTBEATS_URL }}
-          SUBMISSION_ID: ${{ steps.submission.outputs.submission_id }}
+          SUBMISSION_ID: ${{ needs.setup.outputs.submission_id }}
           OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
         run: |
           set -euo pipefail
