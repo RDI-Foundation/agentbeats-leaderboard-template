@@ -6,13 +6,29 @@ on:
     paths:
       - 'scenario.toml'
 
+env:
+  NUM_SHARDS: 4
+
 jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      shard_indices: ${{ steps.gen.outputs.shard_indices }}
+    steps:
+      - id: gen
+        run: echo "shard_indices=$(seq 0 $(( ${{ env.NUM_SHARDS }} - 1 )) | jq -sc .)" >> "$GITHUB_OUTPUT"
+
   run:
+    needs: setup
     runs-on: ubuntu-latest
     if: github.event.repository.fork == true || github.ref != 'refs/heads/main'
     permissions:
-      contents: write
+      contents: read
       packages: read
+
+    strategy:
+      matrix:
+        shard_index: ${{ fromJson(needs.setup.outputs.shard_indices) }}
 
     steps:
       - name: Checkout
@@ -25,6 +41,9 @@ jobs:
 
       - name: Install dependencies
         run: pip install tomli tomli-w pyyaml requests
+
+      - name: Patch scenario.toml with shard config
+        run: python patch_shard.py --shard-index ${{ matrix.shard_index }} --num-shards ${{ env.NUM_SHARDS }}
 
       - name: Generate docker-compose.yml
         run: python generate_compose.py --scenario scenario.toml
@@ -75,6 +94,37 @@ jobs:
       - name: Record provenance
         run: python record_provenance.py --compose docker-compose.yml --output output/provenance.json
 
+      - name: Upload shard result
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard_index }}
+          path: |
+            output/results.json
+            output/provenance.json
+
+      - name: Cleanup
+        if: always()
+        run: docker compose down -v || true
+
+  submit:
+    runs-on: ubuntu-latest
+    needs: run
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download shard results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          path: shard-results
+
+      - name: Aggregate shard results
+        run: python aggregate_shards.py --num-shards ${{ env.NUM_SHARDS }}
+
       - name: Generate submission metadata
         id: metadata
         run: |
@@ -122,7 +172,3 @@ jobs:
           echo "[Click here to open a pull request](https://github.com/${{ steps.target.outputs.repo }}/compare/main...${{ github.repository_owner }}:${{ github.event.repository.name }}:${{ steps.metadata.outputs.branch_name }}?expand=1)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "⚠️ When creating the PR, UNCHECK 'Allow edits and access to secrets by maintainers' to protect your secrets." >> $GITHUB_STEP_SUMMARY
-
-      - name: Cleanup
-        if: always()
-        run: docker compose down -v || true

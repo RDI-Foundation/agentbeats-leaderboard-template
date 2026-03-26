@@ -11,17 +11,37 @@ on:
         description: Agentbeats backend base URL for this quick-submit run
         required: false
         type: string
+      num_shards:
+        description: Number of parallel shards to run (default 1)
+        required: false
+        type: number
     secrets:
       GREEN_SECRETS_JSON:
         description: Optional JSON object mapping green config key -> secret value.
         required: false
 
+env:
+  NUM_SHARDS: ${{ inputs.num_shards || 1 }}
+
 jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      shard_indices: ${{ steps.gen.outputs.shard_indices }}
+    steps:
+      - id: gen
+        run: echo "shard_indices=$(seq 0 $(( ${{ inputs.num_shards || 1 }} - 1 )) | jq -sc .)" >> "$GITHUB_OUTPUT"
+
   run:
+    needs: setup
     runs-on: ubuntu-latest
     permissions:
       id-token: write
-      contents: write
+      contents: read
+
+    strategy:
+      matrix:
+        shard_index: ${{ fromJson(needs.setup.outputs.shard_indices) }}
 
     env:
       AGENTBEATS_URL: ${{ inputs.backend_url || vars.QUICK_SUBMIT_BACKEND_URL || 'https://agentbeats.dev' }}
@@ -267,12 +287,27 @@ jobs:
           echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
           "${RUNNER_TEMP}/bin/amber" --help >/dev/null
 
+      - name: Patch scenario with shard config
+        shell: bash
+        env:
+          SHARD_INDEX: ${{ matrix.shard_index }}
+          NUM_SHARDS: ${{ env.NUM_SHARDS }}
+          SCENARIO_PATH: ${{ steps.scenario.outputs.path }}
+        run: |
+          set -euo pipefail
+          # Inject shard_index and num_shards into the gateway's assessment_config,
+          # which the gateway forwards to the green agent's EvalRequest config.
+          jq --argjson shard_index "$SHARD_INDEX" --argjson num_shards "$NUM_SHARDS" \
+            '.components.gateway.config.assessment_config.shard_index = $shard_index |
+             .components.gateway.config.assessment_config.num_shards = $num_shards' \
+            "$SCENARIO_PATH" > scenario-shard.json
+
       - name: Compile scenario
         shell: bash
         run: |
           set -euo pipefail
           rm -rf "${AMBER_COMPOSE_DIR}"
-          amber compile "${{ steps.scenario.outputs.path }}" \
+          amber compile scenario-shard.json \
             --output scenario-ir.json \
             --docker-compose "${AMBER_COMPOSE_DIR}"
           if ! jq -e '.exports[] | select(.name == "results" and .capability.kind == "http")' scenario-ir.json > /dev/null; then
@@ -407,6 +442,118 @@ jobs:
               }
             }' > provenance.json
 
+      - name: Upload shard result
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard_index }}
+          path: |
+            results.json
+            provenance.json
+
+  submit:
+    runs-on: ubuntu-latest
+    needs: run
+    permissions:
+      contents: write
+      id-token: write
+
+    env:
+      AGENTBEATS_URL: ${{ inputs.backend_url || vars.QUICK_SUBMIT_BACKEND_URL || 'https://agentbeats.dev' }}
+      OIDC_AUDIENCE: ${{ vars.QUICK_SUBMIT_OIDC_AUDIENCE || 'agentbeats-quick-submit-production' }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+
+      - name: Resolve submission ID
+        id: submission
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref_name="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-}}"
+          if [[ "$ref_name" =~ ^quick-submit-([0-9a-fA-F-]{36})$ ]]; then
+            echo "submission_id=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Unable to derive submission ID from branch: $ref_name" >&2
+          exit 1
+
+      - name: Find scenario file
+        id: scenario
+        shell: bash
+        env:
+          SUBMISSION_ID: ${{ steps.submission.outputs.submission_id }}
+        run: |
+          set -euo pipefail
+          scenario=$(ls submissions/*"${SUBMISSION_ID}"*.json 2>/dev/null | grep -v provenance | head -1)
+          if [[ -z "$scenario" ]]; then
+            echo "No scenario file found for submission ${SUBMISSION_ID}" >&2
+            exit 1
+          fi
+          base=$(basename "$scenario" .json)
+          echo "path=$scenario" >> "$GITHUB_OUTPUT"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+
+      - name: Download shard results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          path: shard-results
+
+      - name: Aggregate shard results
+        run: |
+          # Concatenate results arrays across all shards.
+          shard_files=$(for i in $(seq 0 $(( ${{ env.NUM_SHARDS }} - 1 ))); do echo "shard-results/shard-${i}/results.json"; done)
+          # Verify participants are identical across all shards
+          expected_participants=$(jq '.participants' shard-results/shard-0/results.json)
+          for shard_file in $shard_files; do
+            got=$(jq '.participants' "$shard_file")
+            if [ "$got" != "$expected_participants" ]; then
+              echo "Error: participants mismatch in $shard_file" >&2
+              exit 1
+            fi
+          done
+          jq -s '{
+            participants: (.[0].participants // {}),
+            results: (map(.results) | add)
+          }' $shard_files > results.json
+
+      - name: Aggregate provenance
+        run: |
+          # image_digests and github_actions must be identical across shards;
+          # collect shard_timestamps and shard_manifest_digests arrays.
+          shard_files=$(for i in $(seq 0 $(( ${{ env.NUM_SHARDS }} - 1 ))); do echo "shard-results/shard-${i}/provenance.json"; done)
+          expected_image_digests=$(jq '.image_digests' shard-results/shard-0/provenance.json)
+          expected_github_actions=$(jq '.github_actions' shard-results/shard-0/provenance.json)
+          timestamps='[]'
+          manifest_digests='[]'
+          for shard_file in $shard_files; do
+            got=$(jq '.image_digests' "$shard_file")
+            if [ "$got" != "$expected_image_digests" ]; then
+              echo "Error: image_digests mismatch in $shard_file" >&2; exit 1
+            fi
+            got=$(jq '.github_actions' "$shard_file")
+            if [ "$got" != "$expected_github_actions" ]; then
+              echo "Error: github_actions mismatch in $shard_file" >&2; exit 1
+            fi
+            ts=$(jq '.timestamp' "$shard_file")
+            timestamps=$(echo "$timestamps" | jq --argjson ts "$ts" '. + [$ts]')
+            md=$(jq '.manifest_digests' "$shard_file")
+            manifest_digests=$(echo "$manifest_digests" | jq --argjson md "$md" '. + [$md]')
+          done
+          jq -n \
+            --argjson image_digests "$expected_image_digests" \
+            --argjson shard_manifest_digests "$manifest_digests" \
+            --argjson shard_timestamps "$timestamps" \
+            --argjson github_actions "$expected_github_actions" \
+            '{
+              image_digests: $image_digests,
+              shard_manifest_digests: $shard_manifest_digests,
+              shard_timestamps: $shard_timestamps,
+              github_actions: $github_actions
+            }' > provenance.json
+
       - name: Commit results
         env:
           BASE: ${{ steps.scenario.outputs.base }}
@@ -419,6 +566,21 @@ jobs:
           git add "results/${BASE}.json" "submissions/${BASE}-provenance.json"
           git commit -m "[AgentBeats] Scenario results"
           git push
+
+      - name: Fetch GitHub OIDC token
+        id: oidc
+        shell: bash
+        run: |
+          set -euo pipefail
+          oidc_response="$(curl -fsS \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}")"
+          oidc_token="$(jq -r '.value' <<<"$oidc_response")"
+          if [[ -z "$oidc_token" || "$oidc_token" == "null" ]]; then
+            echo "Failed to fetch OIDC token" >&2; exit 1
+          fi
+          echo "::add-mask::$oidc_token"
+          echo "token=$oidc_token" >> "$GITHUB_OUTPUT"
 
       - name: Delete secrets from backend
         if: success()
