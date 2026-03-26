@@ -1,6 +1,6 @@
-# Reusable workflow - called from leaderboard repos via quick-submit.yml (@v1).
-# After making changes, move the tag so leaderboard repos using @v1 pick up the update:
-#   git tag -f v1 && git push origin v1 --force
+# Reusable workflow - called from leaderboard repos via quick-submit.yml.
+# After making changes, move the tag so leaderboard repos using @v2 pick up the update:
+#   git tag -f v2 && git push origin v2 --force
 
 name: Quick-Submit Amber Runner
 
@@ -35,9 +35,9 @@ jobs:
       AMBER_PROXY_PORT: "18080"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
-          ref: ${{ github.head_ref }}
+          ref: ${{ github.head_ref || github.ref }}
 
       - name: Resolve submission ID
         id: submission
@@ -106,7 +106,7 @@ jobs:
 
       - name: Authenticate to GCP
         id: gcp-auth
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ env.GCP_WIF_PROVIDER }}
           service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
