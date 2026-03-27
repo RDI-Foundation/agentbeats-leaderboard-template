@@ -126,7 +126,7 @@ jobs:
       contents: write
 
     env:
-      AGENTBEATS_URL: ${{ vars.QUICK_SUBMIT_BACKEND_URL || 'https://agentbeats.dev' }}
+      AGENTBEATS_URL: ${{ inputs.backend_url || vars.QUICK_SUBMIT_BACKEND_URL || 'https://agentbeats.dev' }}
       OIDC_AUDIENCE: ${{ vars.QUICK_SUBMIT_OIDC_AUDIENCE || 'agentbeats-quick-submit-production' }}
       GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER || 'projects/352582078246/locations/global/workloadIdentityPools/agentbeats-prod/providers/github' }}
       GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT || 'agentbeats-prod-quick-submit@komyo-agentbeats.iam.gserviceaccount.com' }}
