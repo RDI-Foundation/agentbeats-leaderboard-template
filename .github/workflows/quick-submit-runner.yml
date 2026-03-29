@@ -251,6 +251,30 @@ jobs:
           console.log(`Exported ${exportCount} repo-owned green secrets`);
           NODE
 
+      # Amber compile resolves ${config.foo} from the environment; JSON Schema "default" in the
+      # scenario file is not merged into that map. Optional secrets omitted from the decrypted
+      # submitter bundle must still exist as empty env vars (tau2 leaderboard: *_deepseek_api_key,
+      # *_gemini_api_key for green + agent).
+      - name: Default optional Amber config keys omitted from secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          defaults=(
+            AMBER_CONFIG_AGENT_deepseek_api_key
+            AMBER_CONFIG_AGENT_gemini_api_key
+            AMBER_CONFIG_AGENT_DEEPSEEK_API_KEY
+            AMBER_CONFIG_AGENT_GEMINI_API_KEY
+            AMBER_CONFIG_GREEN_deepseek_api_key
+            AMBER_CONFIG_GREEN_gemini_api_key
+            AMBER_CONFIG_GREEN_DEEPSEEK_API_KEY
+            AMBER_CONFIG_GREEN_GEMINI_API_KEY
+          )
+          for name in "${defaults[@]}"; do
+            if ! printenv "$name" >/dev/null 2>&1; then
+              echo "${name}=" >> "$GITHUB_ENV"
+            fi
+          done
+
       - name: Install Amber CLI
         shell: bash
         run: |
