@@ -295,12 +295,6 @@ jobs:
             echo "Scenario must export an HTTP capability named 'results'" >&2
             exit 1
           fi
-          if jq -e '.. | objects | select((.kind? == "docker") or (.kind? == "framework" and .capability? == "docker"))' scenario-ir.json > /dev/null; then
-            if [[ ! -S /var/run/docker.sock ]]; then
-              echo "Scenario uses framework.docker but /var/run/docker.sock is unavailable" >&2
-              exit 1
-            fi
-          fi
 
       - name: Run scenario — shard-${{ matrix.shard_index }}
         shell: bash
