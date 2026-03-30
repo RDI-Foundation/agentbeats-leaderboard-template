@@ -1,6 +1,6 @@
-# Reusable workflow - called from leaderboard repos via quick-submit.yml (@v1).
-# After making changes, move the tag so leaderboard repos using @v1 pick up the update:
-#   git tag -f v1 && git push origin v1 --force
+# Reusable workflow - called from leaderboard repos via quick-submit.yml.
+# After making changes, move the tag so leaderboard repos using @v2 pick up the update:
+#   git tag -f v2 && git push origin v2 --force
 
 name: Quick-Submit Amber Runner
 
@@ -11,31 +11,33 @@ on:
         description: Agentbeats backend base URL for this quick-submit run
         required: false
         type: string
+      num_shards:
+        description: Number of parallel shards to run (default 1)
+        required: false
+        type: number
+      num_instances:
+        description: Total number of task instances to run across all shards (default all)
+        required: false
+        type: number
     secrets:
       GREEN_SECRETS_JSON:
         description: Optional JSON object mapping green config key -> secret value.
         required: false
 
+env:
+  NUM_SHARDS: ${{ inputs.num_shards || 1 }}
+
 jobs:
-  run:
+  setup:
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: write
-
-    env:
-      AGENTBEATS_URL: ${{ inputs.backend_url || vars.QUICK_SUBMIT_BACKEND_URL || 'https://agentbeats.dev' }}
-      OIDC_AUDIENCE: ${{ vars.QUICK_SUBMIT_OIDC_AUDIENCE || 'agentbeats-quick-submit-production' }}
-      GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER || 'projects/352582078246/locations/global/workloadIdentityPools/agentbeats-prod/providers/github' }}
-      GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT || 'agentbeats-prod-quick-submit@komyo-agentbeats.iam.gserviceaccount.com' }}
-      RESULTS_TIMEOUT_MINUTES: ${{ vars.QUICK_SUBMIT_TIMEOUT_MINUTES || '30' }}
-      AMBER_IMAGE: ghcr.io/rdi-foundation/amber-cli:v0.3
-      AMBER_COMPOSE_DIR: amber-compose
-      AMBER_COMPOSE_PROJECT: amber-quick-submit-${{ github.run_id }}-${{ github.run_attempt }}
-      AMBER_PROXY_PORT: "18080"
-
+    outputs:
+      shard_indices: ${{ steps.gen.outputs.shard_indices }}
+      scenario_path: ${{ steps.scenario.outputs.path }}
+      scenario_base: ${{ steps.scenario.outputs.base }}
+      submission_id: ${{ steps.submission.outputs.submission_id }}
+      use_backend: ${{ steps.backend_check.outputs.use_backend }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ github.head_ref }}
 
@@ -68,7 +70,58 @@ jobs:
           echo "path=$scenario" >> "$GITHUB_OUTPUT"
           echo "base=$base" >> "$GITHUB_OUTPUT"
 
+      - id: gen
+        run: echo "shard_indices=$(seq 0 $(( ${{ inputs.num_shards || 1 }} - 1 )) | jq -sc .)" >> "$GITHUB_OUTPUT"
+
+      - name: Check backend availability
+        id: backend_check
+        run: |
+          if [[ -n "${{ vars.QUICK_SUBMIT_BACKEND_URL }}${{ inputs.backend_url }}" ]]; then
+            echo "use_backend=true" >> "$GITHUB_OUTPUT"
+          fi
+
+
+  eval:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      matrix:
+        shard_index: ${{ fromJSON(needs.setup.outputs.shard_indices) }}
+      fail-fast: false
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      AGENTBEATS_URL: ${{ inputs.backend_url || vars.QUICK_SUBMIT_BACKEND_URL || 'https://agentbeats.dev' }}
+      OIDC_AUDIENCE: ${{ vars.QUICK_SUBMIT_OIDC_AUDIENCE || 'agentbeats-quick-submit-production' }}
+      GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER || 'projects/352582078246/locations/global/workloadIdentityPools/agentbeats-prod/providers/github' }}
+      GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT || 'agentbeats-prod-quick-submit@komyo-agentbeats.iam.gserviceaccount.com' }}
+      AMBER_IMAGE: ghcr.io/rdi-foundation/amber-cli:v0.3
+      AMBER_COMPOSE_DIR: amber-compose
+      AMBER_COMPOSE_PROJECT: amber-qs-${{ github.run_id }}-${{ github.run_attempt }}-shard-${{ matrix.shard_index }}
+      AMBER_PROXY_PORT: "18080"
+      RESULTS_TIMEOUT_MINUTES: ${{ vars.QUICK_SUBMIT_TIMEOUT_MINUTES || '30' }}
+
+    steps:
+      - name: Free disk space
+        run: |
+          echo "Before: $(df -h / | tail -1 | awk '{print $4}') free"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/chromium /usr/local/graalvm /opt/hostedtoolcache 2>/dev/null || true
+          sudo docker image prune -af 2>/dev/null || true
+          echo "After: $(df -h / | tail -1 | awk '{print $4}') free"
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.head_ref || github.ref }}
+
+      # Secrets (OIDC → backend → GCP KMS → decrypt).
+      # Skipped when no backend is configured (e.g. test repos using GREEN_SECRETS_JSON).
       - name: Fetch GitHub OIDC token
+        if: needs.setup.outputs.use_backend == 'true'
         id: oidc
         shell: bash
         run: |
@@ -84,11 +137,12 @@ jobs:
           echo "token=$oidc_token" >> "$GITHUB_OUTPUT"
 
       - name: Fetch secrets bundle
+        if: needs.setup.outputs.use_backend == 'true'
         id: bundle
         shell: bash
         env:
           BACKEND_URL: ${{ env.AGENTBEATS_URL }}
-          SUBMISSION_ID: ${{ steps.submission.outputs.submission_id }}
+          SUBMISSION_ID: ${{ needs.setup.outputs.submission_id }}
           OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
         run: |
           set -euo pipefail
@@ -105,14 +159,16 @@ jobs:
           echo "key_id=$(jq -r '.metadata.key_id' secrets_response.json)" >> "$GITHUB_OUTPUT"
 
       - name: Authenticate to GCP
+        if: needs.setup.outputs.use_backend == 'true'
         id: gcp-auth
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ env.GCP_WIF_PROVIDER }}
           service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
           token_format: access_token
 
       - name: Unwrap DEK via KMS
+        if: needs.setup.outputs.use_backend == 'true'
         id: dek
         shell: bash
         env:
@@ -135,7 +191,7 @@ jobs:
           echo "dek_b64=$dek_b64" >> "$GITHUB_OUTPUT"
 
       - name: Decrypt and export secrets
-        id: submitter-secrets
+        if: needs.setup.outputs.use_backend == 'true'
         shell: bash
         env:
           DEK_B64: ${{ steps.dek.outputs.dek_b64 }}
@@ -162,7 +218,6 @@ jobs:
           // Export all secrets as env vars with AMBER_CONFIG_ prefix (green + participant secrets)
           const fs = require('fs');
           const envFile = process.env.GITHUB_ENV;
-          const outputFile = process.env.GITHUB_OUTPUT;
 
           function exportSecret(key, value) {
             console.log(`::add-mask::${value}`);
@@ -179,11 +234,6 @@ jobs:
             }
           }
 
-          const greenKeys = Object.keys(secrets.green || {})
-            .map((key) => key.toLowerCase())
-            .sort();
-          fs.appendFileSync(outputFile, `green_keys_json=${JSON.stringify(greenKeys)}\n`);
-
           console.log(`Exported ${Object.keys(secrets.green || {}).length} green secrets`);
           console.log(`Exported secrets for ${(secrets.participants || []).length} participants`);
           NODE
@@ -192,74 +242,27 @@ jobs:
         shell: bash
         env:
           GREEN_SECRETS_JSON: ${{ secrets.GREEN_SECRETS_JSON }}
-          SUBMITTER_GREEN_KEYS_JSON: ${{ steps.submitter-secrets.outputs.green_keys_json }}
         run: |
           set -euo pipefail
-          node - <<'NODE'
-          const crypto = require('crypto');
-          const fs = require('fs');
+          if [[ -z "$GREEN_SECRETS_JSON" ]]; then
+            echo "No GREEN_SECRETS_JSON provided; skipping"
+            exit 0
+          fi
+          echo "$GREEN_SECRETS_JSON" | jq -r 'to_entries[] | "AMBER_CONFIG_GREEN_\(.key)=\(.value)"' | while IFS= read -r line; do
+            val="${line#*=}"
+            echo "::add-mask::${val}"
+            echo "$line" >> "$GITHUB_ENV"
+          done
+          count=$(echo "$GREEN_SECRETS_JSON" | jq 'length')
+          echo "Exported ${count} green secrets from GREEN_SECRETS_JSON"
 
-          const raw = process.env.GREEN_SECRETS_JSON?.trim();
-          if (!raw) {
-            console.log('No repo-owned green secrets configured');
-            process.exit(0);
-          }
-
-          let greenSecrets;
-          try {
-            greenSecrets = JSON.parse(raw);
-          } catch (error) {
-            throw new Error(`GREEN_SECRETS_JSON must be valid JSON: ${error.message}`);
-          }
-          if (!greenSecrets || typeof greenSecrets !== 'object' || Array.isArray(greenSecrets)) {
-            throw new Error('GREEN_SECRETS_JSON must be a JSON object');
-          }
-
-          const submitterGreenKeys = new Set(
-            JSON.parse(process.env.SUBMITTER_GREEN_KEYS_JSON || '[]').map((key) =>
-              String(key).toLowerCase()
-            )
-          );
-          const envFile = process.env.GITHUB_ENV;
-          const configKeyPattern = /^[a-z][a-z0-9_]*$/;
-
-          function appendEnv(name, value) {
-            const delimiter = `__AGENTBEATS_${crypto.randomUUID()}__`;
-            fs.appendFileSync(envFile, `${name}<<${delimiter}\n${value}\n${delimiter}\n`);
-          }
-
-          let exportCount = 0;
-          for (const [configKey, value] of Object.entries(greenSecrets)) {
-            if (!configKeyPattern.test(configKey)) {
-              throw new Error(
-                `invalid green config key ${JSON.stringify(configKey)}; expected ^[a-z][a-z0-9_]*$`
-              );
-            }
-            if (typeof value !== 'string') {
-              throw new Error(`GREEN_SECRETS_JSON value for green.${configKey} must be a string`);
-            }
-            if (submitterGreenKeys.has(configKey)) {
-              throw new Error(
-                `repo-owned binding for green.${configKey} collides with a submitter-provided green secret`
-              );
-            }
-            console.log(`::add-mask::${value}`);
-            appendEnv(`AMBER_CONFIG_GREEN_${configKey.toUpperCase()}`, value);
-            exportCount += 1;
-          }
-
-          console.log(`Exported ${exportCount} repo-owned green secrets`);
-          NODE
-
-      - name: Install Amber CLI
+      - name: Install amber CLI
         shell: bash
         run: |
           set -euo pipefail
           docker pull "${AMBER_IMAGE}"
           cid="$(docker create "${AMBER_IMAGE}")"
-          cleanup() {
-            docker rm "${cid}" >/dev/null 2>&1 || true
-          }
+          cleanup() { docker rm "${cid}" >/dev/null 2>&1 || true; }
           trap cleanup EXIT
           install -d "${RUNNER_TEMP}/bin"
           docker cp "${cid}:/amber" "${RUNNER_TEMP}/bin/amber"
@@ -267,30 +270,39 @@ jobs:
           echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
           "${RUNNER_TEMP}/bin/amber" --help >/dev/null
 
+      - name: Patch shard config into scenario
+        run: |
+          jq --argjson shard_index ${{ matrix.shard_index }} \
+             --argjson num_shards ${NUM_SHARDS} \
+             --argjson num_instances '${{ inputs.num_instances || 'null' }}' \
+            '
+             .components.gateway.config.assessment_config.shard_index = $shard_index |
+             .components.gateway.config.assessment_config.num_shards = $num_shards |
+             if $num_instances then .components.gateway.config.assessment_config.num_instances = $num_instances else . end
+            ' \
+            "${{ needs.setup.outputs.scenario_path }}" > patched.json
+          mv patched.json "${{ needs.setup.outputs.scenario_path }}"
+
       - name: Compile scenario
         shell: bash
         run: |
           set -euo pipefail
           rm -rf "${AMBER_COMPOSE_DIR}"
-          amber compile "${{ steps.scenario.outputs.path }}" \
+          amber compile "${{ needs.setup.outputs.scenario_path }}" \
             --output scenario-ir.json \
             --docker-compose "${AMBER_COMPOSE_DIR}"
           if ! jq -e '.exports[] | select(.name == "results" and .capability.kind == "http")' scenario-ir.json > /dev/null; then
             echo "Scenario must export an HTTP capability named 'results'" >&2
             exit 1
           fi
-          if jq -e '.. | objects | select(.kind? == "docker")' scenario-ir.json > /dev/null; then
+          if jq -e '.. | objects | select((.kind? == "docker") or (.kind? == "framework" and .capability? == "docker"))' scenario-ir.json > /dev/null; then
             if [[ ! -S /var/run/docker.sock ]]; then
               echo "Scenario uses framework.docker but /var/run/docker.sock is unavailable" >&2
               exit 1
             fi
-            echo "Scenario uses framework.docker; exporting /var/run/docker.sock to Docker Compose"
-            echo "AMBER_DOCKER_SOCK=/var/run/docker.sock" >> "${GITHUB_ENV}"
-          else
-            echo "Scenario does not use framework.docker"
           fi
 
-      - name: Run scenario
+      - name: Run scenario — shard-${{ matrix.shard_index }}
         shell: bash
         run: |
           set -euo pipefail
@@ -317,72 +329,18 @@ jobs:
           }
           trap cleanup EXIT
 
-          "${compose[@]}" up -d
-          "${compose[@]}" logs -f --no-color &
-          logs_pid=$!
+          "${compose[@]}" pull --quiet
 
-          amber proxy "${AMBER_COMPOSE_DIR}" \
-            --project-name "${AMBER_COMPOSE_PROJECT}" \
-            --export "results=127.0.0.1:${AMBER_PROXY_PORT}" > amber-proxy.log 2>&1 &
-          proxy_pid=$!
-
-          poll_url="http://127.0.0.1:${AMBER_PROXY_PORT}/"
-          echo "Polling ${poll_url}..."
-          status=""
-          deadline=$((SECONDS + (60 * RESULTS_TIMEOUT_MINUTES)))
-          while (( SECONDS < deadline )); do
-            if ! kill -0 "${proxy_pid}" >/dev/null 2>&1; then
-              echo "amber proxy exited unexpectedly" >&2
-              exit 1
-            fi
-            response="$(curl -fsS "${poll_url}" || true)"
-            if [[ -z "${response}" ]]; then
-              sleep 5
-              continue
-            fi
-            status="$(jq -r '.status // empty' <<<"${response}")"
-            if [[ -z "${status}" ]]; then
-              echo "Unexpected results payload:" >&2
-              echo "${response}" >&2
-              sleep 5
-              continue
-            fi
-            if [[ "${status}" != "running" ]]; then
-              jq . <<<"${response}" > results.json
-              echo "Scenario finished with status: ${status}"
-              break
-            fi
-            sleep 5
-          done
-          if [[ ! -f results.json ]]; then
-            echo "Timed out waiting ${RESULTS_TIMEOUT_MINUTES} minutes for scenario results" >&2
-            exit 1
-          fi
-          if [[ "${status}" != "completed" ]]; then
-            exit 1
-          fi
-
-      - name: Stop scenario
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker compose -f "${AMBER_COMPOSE_DIR}/compose.yaml" -p "${AMBER_COMPOSE_PROJECT}" down -v --remove-orphans
-
-      - name: Add participants to results
-        run: |
-          participants=$(jq '.metadata.agentbeats_ids // {}' "${{ steps.scenario.outputs.path }}")
-          jq --argjson participants "$participants" '. + {participants: $participants}' results.json > results-final.json
-          mv results-final.json results.json
-
-      - name: Generate provenance
-        run: |
+          # Generate provenance (image digests + manifest digests) — same as main.
+          # All shards compile the same scenario and pull the same images,
+          # so provenance is identical; summary picks one.
           image_digests=$(jq -r '.components[] | select(.program) | "\(.moniker)=\(.program.image)"' scenario-ir.json | while IFS='=' read -r name image; do
             digest=$(docker image inspect "$image" --format '{{index .RepoDigests 0}}')
             printf '%s\t%s\n' "$name" "$digest"
           done | jq -Rn '[inputs | split("\t") | {(.[0]): .[1]}] | add // {}')
-          timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           manifest_digests=$(jq '[.components[] | {(.moniker): .digest}] | add // {}' scenario-ir.json)
+          timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          mkdir -p amber-compose/output
           jq -n \
             --argjson image_digests "$image_digests" \
             --argjson manifest_digests "$manifest_digests" \
@@ -405,11 +363,195 @@ jobs:
                 workflow_ref: $workflow_ref,
                 workflow_sha: $workflow_sha
               }
+            }' > amber-compose/output/provenance.json
+          echo "Provenance:"
+          cat amber-compose/output/provenance.json
+
+          "${compose[@]}" up -d
+          "${compose[@]}" logs -f --no-color &
+          logs_pid=$!
+
+          amber proxy "${AMBER_COMPOSE_DIR}" \
+            --project-name "${AMBER_COMPOSE_PROJECT}" \
+            --export "results=127.0.0.1:${AMBER_PROXY_PORT}" > amber-proxy.log 2>&1 &
+          proxy_pid=$!
+
+          poll_url="http://127.0.0.1:${AMBER_PROXY_PORT}/"
+          echo "Polling ${poll_url} for shard ${{ matrix.shard_index }}..."
+          status=""
+          deadline=$((SECONDS + (60 * RESULTS_TIMEOUT_MINUTES)))
+          while (( SECONDS < deadline )); do
+            if ! kill -0 "${proxy_pid}" >/dev/null 2>&1; then
+              echo "amber proxy exited unexpectedly" >&2
+              exit 1
+            fi
+            response="$(curl -fsS "${poll_url}" || true)"
+            if [[ -z "${response}" ]]; then
+              sleep 5
+              continue
+            fi
+            status="$(jq -r '.status // empty' <<<"${response}")"
+            if [[ -z "${status}" ]]; then
+              echo "Unexpected results payload:" >&2
+              echo "${response}" >&2
+              sleep 5
+              continue
+            fi
+            if [[ "${status}" != "running" ]]; then
+              mkdir -p amber-compose/output
+              jq . <<<"${response}" > amber-compose/output/results.json
+              echo "Shard ${{ matrix.shard_index }} finished with status: ${status}"
+              break
+            fi
+            sleep 5
+          done
+          if [[ ! -f amber-compose/output/results.json ]]; then
+            echo "Timed out waiting ${RESULTS_TIMEOUT_MINUTES} minutes for shard results" >&2
+            exit 1
+          fi
+          if [[ "${status}" != "completed" ]]; then
+            echo "Batch failed:" >&2
+            cat amber-compose/output/results.json >&2
+            exit 1
+          fi
+        timeout-minutes: 300
+
+      - name: Show container logs
+        if: always()
+        run: |
+          compose=(docker compose -f amber-compose/compose.yaml -p "${AMBER_COMPOSE_PROJECT}")
+          for svc in $("${compose[@]}" ps --services 2>/dev/null || true); do
+            echo "=== ${svc} (last 80) ==="
+            "${compose[@]}" logs "${svc}" 2>&1 | tail -80 || true
+          done
+
+      - name: Stop scenario
+        if: always()
+        run: docker compose -f amber-compose/compose.yaml -p "${AMBER_COMPOSE_PROJECT}" down -v --remove-orphans || true
+
+      - name: Upload shard results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: shard-${{ matrix.shard_index }}
+          path: |
+            amber-compose/output/results.json
+            amber-compose/output/provenance.json
+
+  summary:
+    needs: [setup, eval]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+    env:
+      AGENTBEATS_URL: ${{ vars.QUICK_SUBMIT_BACKEND_URL || 'https://agentbeats.dev' }}
+      OIDC_AUDIENCE: ${{ vars.QUICK_SUBMIT_OIDC_AUDIENCE || 'agentbeats-quick-submit-production' }}
+      SCENARIO_PATH: ${{ needs.setup.outputs.scenario_path }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.head_ref || github.ref }}
+
+      - name: Download all shard artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: shard-artifacts
+          pattern: shard-*
+          merge-multiple: false
+
+      - name: Aggregate results
+        run: |
+          set -euo pipefail
+          # Single-artifact downloads extract flat; normalize to subdirs
+          if [[ -f "shard-artifacts/results.json" && ! -d "shard-artifacts/shard-0" ]]; then
+            mkdir -p shard-artifacts/shard-0
+            mv shard-artifacts/results.json shard-artifacts/shard-0/
+            mv shard-artifacts/provenance.json shard-artifacts/shard-0/ 2>/dev/null || true
+          fi
+          # Build expected file paths from shard count
+          shard_results=()
+          for i in $(seq 0 $(( ${NUM_SHARDS} - 1 ))); do
+            f="shard-artifacts/shard-${i}/results.json"
+            if [[ ! -f "$f" ]]; then
+              echo "ERROR: missing results for shard ${i}" >&2
+              ls -R shard-artifacts/ >&2 || true
+              exit 1
+            fi
+            shard_results+=("$f")
+          done
+          # Extract participants (agentbeats IDs) from submission
+          participants=$(jq '
+            .components
+            | to_entries
+            | map(select(.value.agentbeats_id))
+            | map({(.key): .value.agentbeats_id})
+            | add // {}
+          ' "${SCENARIO_PATH}")
+          jq -s --argjson participants "$participants" '{
+            status: (if all(.[]; .status == "completed") then "completed"
+                    elif any(.[]; .status == "completed") then "partial"
+                    else "failed" end),
+            participants: $participants,
+            results: [.[].results[] | if .results then .results[] else . end]
+          }' "${shard_results[@]}" > results.json
+
+      - name: Validate and merge provenance
+        run: |
+          set -euo pipefail
+          # Build expected file paths from shard count
+          shard_provenance=()
+          for i in $(seq 0 $(( ${NUM_SHARDS} - 1 ))); do
+            f="shard-artifacts/shard-${i}/provenance.json"
+            if [[ ! -f "$f" ]]; then
+              echo "ERROR: missing provenance for shard ${i}" >&2
+              ls shard-artifacts/ >&2 || true
+              exit 1
+            fi
+            shard_provenance+=("$f")
+          done
+          # image_digests and github_actions must be identical across shards
+          expected_image_digests=$(jq '.image_digests' "${shard_provenance[0]}")
+          expected_github_actions=$(jq '.github_actions' "${shard_provenance[0]}")
+          timestamps='[]'
+          manifest_digests='[]'
+          for f in "${shard_provenance[@]}"; do
+            got=$(jq '.image_digests' "$f")
+            if [[ "$got" != "$expected_image_digests" ]]; then
+              echo "ERROR: image_digests mismatch in $f" >&2; exit 1
+            fi
+            got=$(jq '.github_actions' "$f")
+            if [[ "$got" != "$expected_github_actions" ]]; then
+              echo "ERROR: github_actions mismatch in $f" >&2; exit 1
+            fi
+            timestamps=$(echo "$timestamps" | jq --argjson ts "$(jq '.timestamp' "$f")" '. + [$ts]')
+            manifest_digests=$(echo "$manifest_digests" | jq --argjson md "$(jq '.manifest_digests' "$f")" '. + [$md]')
+          done
+          jq -n \
+            --argjson image_digests "$expected_image_digests" \
+            --argjson shard_manifest_digests "$manifest_digests" \
+            --argjson shard_timestamps "$timestamps" \
+            --argjson github_actions "$expected_github_actions" \
+            '{
+              image_digests: $image_digests,
+              shard_manifest_digests: $shard_manifest_digests,
+              shard_timestamps: $shard_timestamps,
+              github_actions: $github_actions
             }' > provenance.json
+          echo "Provenance:"
+          cat provenance.json
+
+      - name: Upload aggregate results
+        uses: actions/upload-artifact@v7
+        with:
+          name: qs-aggregate
+          path: |
+            results.json
+            provenance.json
 
       - name: Commit results
         env:
-          BASE: ${{ steps.scenario.outputs.base }}
+          BASE: ${{ needs.setup.outputs.scenario_base }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -420,12 +562,30 @@ jobs:
           git commit -m "[AgentBeats] Scenario results"
           git push
 
+      # Cleanup: delete secrets from backend.
+      # Skipped when no backend is configured.
+      - name: Fetch GitHub OIDC token
+        if: success() && needs.setup.outputs.use_backend == 'true'
+        id: oidc
+        shell: bash
+        run: |
+          set -euo pipefail
+          oidc_response="$(curl -fsS \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}")"
+          oidc_token="$(jq -r '.value' <<<"$oidc_response")"
+          if [[ -z "$oidc_token" || "$oidc_token" == "null" ]]; then
+            echo "Failed to fetch OIDC token" >&2; exit 1
+          fi
+          echo "::add-mask::$oidc_token"
+          echo "token=$oidc_token" >> "$GITHUB_OUTPUT"
+
       - name: Delete secrets from backend
-        if: success()
+        if: success() && needs.setup.outputs.use_backend == 'true'
         shell: bash
         env:
           BACKEND_URL: ${{ env.AGENTBEATS_URL }}
-          SUBMISSION_ID: ${{ steps.submission.outputs.submission_id }}
+          SUBMISSION_ID: ${{ needs.setup.outputs.submission_id }}
           OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
         run: |
           set -euo pipefail

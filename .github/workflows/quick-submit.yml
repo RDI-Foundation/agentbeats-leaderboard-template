@@ -8,22 +8,12 @@ on:
 jobs:
   run-scenario:
     if: startsWith(github.head_ref, 'quick-submit-')
-    uses: RDI-Foundation/agentbeats-leaderboard-template/.github/workflows/quick-submit-runner.yml@v2
+    uses: RDI-Foundation/agentbeats-leaderboard-template/.github/workflows/quick-submit-runner.yml@v2-matrix
     permissions:
       id-token: write
       contents: write
-    # Optional: bind leaderboard-repo secrets into the green agent during Quick Submit.
-    # This is fully opt-in.
-    # Pass one explicit secret payload to the reusable workflow. Construct it inline from only
-    # the repo secrets you want to share.
-    # For the common one-secret case:
-    #
-    # secrets:
-    #   GREEN_SECRETS_JSON: >-
-    #     {"holdout_key":${{ toJSON(secrets.HOLDOUT_KEY) }}}
-    #
-    # For multiple secrets:
-    #
-    # secrets:
-    #   GREEN_SECRETS_JSON: >-
-    #     {"holdout_key":${{ toJSON(secrets.HOLDOUT_KEY) }},"holdout_url":${{ toJSON(secrets.HOLDOUT_URL) }}}
+    with:
+      num_shards: 1
+    secrets:
+      GREEN_SECRETS_JSON: >-
+        {"holdout_key":${{ toJSON(secrets.HOLDOUT_KEY) }}}
