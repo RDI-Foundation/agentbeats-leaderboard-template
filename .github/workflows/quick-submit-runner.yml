@@ -416,15 +416,6 @@ jobs:
           fi
         timeout-minutes: 300
 
-      - name: Show container logs
-        if: always()
-        run: |
-          compose=(docker compose -f amber-compose/compose.yaml -p "${AMBER_COMPOSE_PROJECT}")
-          for svc in $("${compose[@]}" ps --services 2>/dev/null || true); do
-            echo "=== ${svc} (last 80) ==="
-            "${compose[@]}" logs "${svc}" 2>&1 | tail -80 || true
-          done
-
       - name: Stop scenario
         if: always()
         run: docker compose -f amber-compose/compose.yaml -p "${AMBER_COMPOSE_PROJECT}" down -v --remove-orphans || true
