@@ -471,14 +471,8 @@ jobs:
             fi
             shard_results+=("$f")
           done
-          # Extract participants (agentbeats IDs) from submission
-          participants=$(jq '
-            .components
-            | to_entries
-            | map(select(.value.agentbeats_id))
-            | map({(.key): .value.agentbeats_id})
-            | add // {}
-          ' "${SCENARIO_PATH}")
+          # Extract participants (agentbeats IDs) from submission metadata
+          participants=$(jq '.metadata.agentbeats_ids // {}' "${SCENARIO_PATH}")
           jq -s --argjson participants "$participants" '{
             status: (if all(.[]; .status == "completed") then "completed"
                     elif any(.[]; .status == "completed") then "partial"
