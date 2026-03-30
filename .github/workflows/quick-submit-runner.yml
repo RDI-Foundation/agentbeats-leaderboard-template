@@ -520,14 +520,6 @@ jobs:
           echo "Provenance:"
           cat provenance.json
 
-      - name: Upload aggregate results
-        uses: actions/upload-artifact@v7
-        with:
-          name: qs-aggregate
-          path: |
-            results.json
-            provenance.json
-
       - name: Commit results
         env:
           BASE: ${{ needs.setup.outputs.scenario_base }}
