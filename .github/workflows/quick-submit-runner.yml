@@ -98,6 +98,10 @@ jobs:
 
     steps:
       - name: Free disk space
+        # GitHub-hosted runners ship with ~20-30 GB of pre-installed toolchains
+        # (.NET, Android SDK, GraalVM, Chromium, etc.) not needed.
+        # Benchmark scenarios often pull large Docker images.
+        # See https://github.com/marketplace/actions/free-disk-space-ubuntu
         run: |
           echo "Before: $(df -h / | tail -1 | awk '{print $4}') free"
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
