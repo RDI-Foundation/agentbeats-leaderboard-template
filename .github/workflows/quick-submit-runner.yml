@@ -72,7 +72,6 @@ jobs:
       - id: gen
         run: echo "shard_indices=$(seq 0 $(( ${{ inputs.num_shards || 1 }} - 1 )) | jq -sc .)" >> "$GITHUB_OUTPUT"
 
-
   eval:
     needs: setup
     runs-on: ubuntu-latest
@@ -108,7 +107,7 @@ jobs:
 
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.head_ref || github.ref }}
+          ref: ${{ github.head_ref }}
 
       # Secrets (OIDC → backend → GCP KMS → decrypt).
       # Skipped when no backend is configured (e.g. test repos using GREEN_SECRETS_JSON).
@@ -179,6 +178,7 @@ jobs:
           echo "dek_b64=$dek_b64" >> "$GITHUB_OUTPUT"
 
       - name: Decrypt and export secrets
+        id: submitter-secrets
         shell: bash
         env:
           DEK_B64: ${{ steps.dek.outputs.dek_b64 }}
@@ -220,6 +220,11 @@ jobs:
               exportSecret(`${prefix}_${key}`, value);
             }
           }
+          const greenKeys = Object.keys(secrets.green || {})
+            .map((key) => key.toLowerCase())
+            .sort();
+          const outputFile = process.env.GITHUB_OUTPUT;
+          fs.appendFileSync(outputFile, `green_keys_json=${JSON.stringify(greenKeys)}\n`);
 
           console.log(`Exported ${Object.keys(secrets.green || {}).length} green secrets`);
           console.log(`Exported secrets for ${(secrets.participants || []).length} participants`);
@@ -229,19 +234,64 @@ jobs:
         shell: bash
         env:
           GREEN_SECRETS_JSON: ${{ secrets.GREEN_SECRETS_JSON }}
+          SUBMITTER_GREEN_KEYS_JSON: ${{ steps.submitter-secrets.outputs.green_keys_json }}
         run: |
           set -euo pipefail
-          if [[ -z "$GREEN_SECRETS_JSON" ]]; then
-            echo "No GREEN_SECRETS_JSON provided; skipping"
-            exit 0
-          fi
-          echo "$GREEN_SECRETS_JSON" | jq -r 'to_entries[] | "AMBER_CONFIG_GREEN_\(.key)=\(.value)"' | while IFS= read -r line; do
-            val="${line#*=}"
-            echo "::add-mask::${val}"
-            echo "$line" >> "$GITHUB_ENV"
-          done
-          count=$(echo "$GREEN_SECRETS_JSON" | jq 'length')
-          echo "Exported ${count} green secrets from GREEN_SECRETS_JSON"
+          node - <<'NODE'
+          const crypto = require('crypto');
+          const fs = require('fs');
+
+          const raw = process.env.GREEN_SECRETS_JSON?.trim();
+          if (!raw) {
+            console.log('No repo-owned green secrets configured');
+            process.exit(0);
+          }
+
+          let greenSecrets;
+          try {
+            greenSecrets = JSON.parse(raw);
+          } catch (error) {
+            throw new Error(`GREEN_SECRETS_JSON must be valid JSON: ${error.message}`);
+          }
+          if (!greenSecrets || typeof greenSecrets !== 'object' || Array.isArray(greenSecrets)) {
+            throw new Error('GREEN_SECRETS_JSON must be a JSON object');
+          }
+
+          const submitterGreenKeys = new Set(
+            JSON.parse(process.env.SUBMITTER_GREEN_KEYS_JSON || '[]').map((key) =>
+              String(key).toLowerCase()
+            )
+          );
+          const envFile = process.env.GITHUB_ENV;
+          const configKeyPattern = /^[a-z][a-z0-9_]*$/;
+
+          function appendEnv(name, value) {
+            const delimiter = `__AGENTBEATS_${crypto.randomUUID()}__`;
+            fs.appendFileSync(envFile, `${name}<<${delimiter}\n${value}\n${delimiter}\n`);
+          }
+
+          let exportCount = 0;
+          for (const [configKey, value] of Object.entries(greenSecrets)) {
+            if (!configKeyPattern.test(configKey)) {
+              throw new Error(
+                `invalid green config key ${JSON.stringify(configKey)}; expected ^[a-z][a-z0-9_]*$`
+              );
+            }
+            if (typeof value !== 'string') {
+              throw new Error(`GREEN_SECRETS_JSON value for green.${configKey} must be a string`);
+            }
+            if (submitterGreenKeys.has(configKey)) {
+              throw new Error(
+                `repo-owned binding for green.${configKey} collides with a submitter-provided green secret`
+              );
+            }
+            console.log(`::add-mask::${value}`);
+            appendEnv(`AMBER_CONFIG_GREEN_${configKey.toUpperCase()}`, value);
+            exportCount += 1;
+          }
+
+          console.log(`Exported ${exportCount} repo-owned green secrets`);
+          NODE
 
       - name: Install amber CLI
         shell: bash
@@ -416,6 +466,9 @@ jobs:
     permissions:
       id-token: write
       contents: write
+    defaults:
+      run:
+        shell: bash
     env:
       AGENTBEATS_URL: ${{ vars.QUICK_SUBMIT_BACKEND_URL || 'https://agentbeats.dev' }}
       OIDC_AUDIENCE: ${{ vars.QUICK_SUBMIT_OIDC_AUDIENCE || 'agentbeats-quick-submit-production' }}
@@ -423,7 +476,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.head_ref || github.ref }}
+          ref: ${{ github.head_ref }}
 
       - name: Download all shard artifacts
         uses: actions/download-artifact@v8
@@ -459,7 +512,7 @@ jobs:
                     elif any(.[]; .status == "completed") then "partial"
                     else "failed" end),
             participants: $participants,
-            results: [.[].results[] | if .results then .results[] else . end]
+            results: [.[].results[]]
           }' "${shard_results[@]}" > results.json
 
       - name: Validate and merge provenance
