@@ -506,15 +506,17 @@ jobs:
             timestamps=$(echo "$timestamps" | jq --argjson ts "$(jq '.timestamp' "$f")" '. + [$ts]')
             manifest_digests=$(echo "$manifest_digests" | jq --argjson md "$(jq '.manifest_digests' "$f")" '. + [$md]')
           done
+          # Output the flat shape the backend expects (manifest_digests + timestamp),
+          # using the first shard's values (all shards are identical).
           jq -n \
             --argjson image_digests "$expected_image_digests" \
-            --argjson shard_manifest_digests "$manifest_digests" \
-            --argjson shard_timestamps "$timestamps" \
+            --argjson manifest_digests "$(echo "$manifest_digests" | jq '.[0]')" \
+            --arg timestamp "$(echo "$timestamps" | jq -r '.[0]')" \
             --argjson github_actions "$expected_github_actions" \
             '{
               image_digests: $image_digests,
-              shard_manifest_digests: $shard_manifest_digests,
-              shard_timestamps: $shard_timestamps,
+              manifest_digests: $manifest_digests,
+              timestamp: $timestamp,
               github_actions: $github_actions
             }' > provenance.json
           echo "Provenance:"
