@@ -35,7 +35,6 @@ jobs:
       scenario_path: ${{ steps.scenario.outputs.path }}
       scenario_base: ${{ steps.scenario.outputs.base }}
       submission_id: ${{ steps.submission.outputs.submission_id }}
-      use_backend: ${{ steps.backend_check.outputs.use_backend }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -72,13 +71,6 @@ jobs:
 
       - id: gen
         run: echo "shard_indices=$(seq 0 $(( ${{ inputs.num_shards || 1 }} - 1 )) | jq -sc .)" >> "$GITHUB_OUTPUT"
-
-      - name: Check backend availability
-        id: backend_check
-        run: |
-          if [[ -n "${{ vars.QUICK_SUBMIT_BACKEND_URL }}${{ inputs.backend_url }}" ]]; then
-            echo "use_backend=true" >> "$GITHUB_OUTPUT"
-          fi
 
 
   eval:
@@ -121,7 +113,6 @@ jobs:
       # Secrets (OIDC → backend → GCP KMS → decrypt).
       # Skipped when no backend is configured (e.g. test repos using GREEN_SECRETS_JSON).
       - name: Fetch GitHub OIDC token
-        if: needs.setup.outputs.use_backend == 'true'
         id: oidc
         shell: bash
         run: |
@@ -137,7 +128,6 @@ jobs:
           echo "token=$oidc_token" >> "$GITHUB_OUTPUT"
 
       - name: Fetch secrets bundle
-        if: needs.setup.outputs.use_backend == 'true'
         id: bundle
         shell: bash
         env:
@@ -159,7 +149,6 @@ jobs:
           echo "key_id=$(jq -r '.metadata.key_id' secrets_response.json)" >> "$GITHUB_OUTPUT"
 
       - name: Authenticate to GCP
-        if: needs.setup.outputs.use_backend == 'true'
         id: gcp-auth
         uses: google-github-actions/auth@v3
         with:
@@ -168,7 +157,6 @@ jobs:
           token_format: access_token
 
       - name: Unwrap DEK via KMS
-        if: needs.setup.outputs.use_backend == 'true'
         id: dek
         shell: bash
         env:
@@ -191,7 +179,6 @@ jobs:
           echo "dek_b64=$dek_b64" >> "$GITHUB_OUTPUT"
 
       - name: Decrypt and export secrets
-        if: needs.setup.outputs.use_backend == 'true'
         shell: bash
         env:
           DEK_B64: ${{ steps.dek.outputs.dek_b64 }}
@@ -538,7 +525,7 @@ jobs:
       # Cleanup: delete secrets from backend.
       # Skipped when no backend is configured.
       - name: Fetch GitHub OIDC token
-        if: success() && needs.setup.outputs.use_backend == 'true'
+        if: success()
         id: oidc
         shell: bash
         run: |
@@ -554,7 +541,7 @@ jobs:
           echo "token=$oidc_token" >> "$GITHUB_OUTPUT"
 
       - name: Delete secrets from backend
-        if: success() && needs.setup.outputs.use_backend == 'true'
+        if: success()
         shell: bash
         env:
           BACKEND_URL: ${{ env.AGENTBEATS_URL }}
