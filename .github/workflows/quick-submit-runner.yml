@@ -293,7 +293,7 @@ jobs:
           console.log(`Exported ${exportCount} repo-owned green secrets`);
           NODE
 
-      - name: Install amber CLI
+      - name: Install Amber CLI
         shell: bash
         run: |
           set -euo pipefail
@@ -360,9 +360,10 @@ jobs:
           }
           trap cleanup EXIT
 
+          # Pull images before starting provenance.
           "${compose[@]}" pull --quiet
 
-          # Generate provenance (image digests + manifest digests) — same as main.
+          # Generate provenance (image digests + manifest digests).
           # All shards compile the same scenario and pull the same images,
           # so provenance is identical; summary picks one.
           image_digests=$(jq -r '.components[] | select(.program) | "\(.moniker)=\(.program.image)"' scenario-ir.json | while IFS='=' read -r name image; do
@@ -408,7 +409,7 @@ jobs:
           proxy_pid=$!
 
           poll_url="http://127.0.0.1:${AMBER_PROXY_PORT}/"
-          echo "Polling ${poll_url} for shard ${{ matrix.shard_index }}..."
+          echo "Polling ${poll_url}..."
           status=""
           deadline=$((SECONDS + (60 * RESULTS_TIMEOUT_MINUTES)))
           while (( SECONDS < deadline )); do
@@ -524,7 +525,7 @@ jobs:
             f="shard-artifacts/shard-${i}/provenance.json"
             if [[ ! -f "$f" ]]; then
               echo "ERROR: missing provenance for shard ${i}" >&2
-              ls shard-artifacts/ >&2 || true
+              ls -R shard-artifacts/ >&2 || true
               exit 1
             fi
             shard_provenance+=("$f")
