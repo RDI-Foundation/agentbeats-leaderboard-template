@@ -94,7 +94,7 @@ jobs:
       AMBER_COMPOSE_DIR: amber-compose
       AMBER_COMPOSE_PROJECT: amber-qs-${{ github.run_id }}-${{ github.run_attempt }}-shard-${{ matrix.shard_index }}
       AMBER_PROXY_PORT: "18080"
-      RESULTS_TIMEOUT_MINUTES: ${{ vars.QUICK_SUBMIT_TIMEOUT_MINUTES || '30' }}
+      RESULTS_TIMEOUT_MINUTES: ${{ vars.QUICK_SUBMIT_TIMEOUT_MINUTES || '300' }}
 
     steps:
       - name: Free disk space
