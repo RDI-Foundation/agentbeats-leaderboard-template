@@ -60,7 +60,18 @@ Include:
 - Any configurable parameters (like task specification)
 - Requirements for participant agents
 
-### 4. Push your changes
+### 4. (Optional) Configure parallel evaluation
+For benchmarks with large numbers of task instances, you can speed up evaluation
+by running tasks in parallel across multiple runners.
+
+Edit `.github/workflows/quick-submit.yml` to use sharding:
+```yaml
+uses: RDI-Foundation/agentbeats-leaderboard-template/.github/workflows/quick-submit-runner.yml@v2
+with:
+  num_shards: 4  # Number of parallel runners. GitHub limit of 20
+```
+
+### 5. Push your changes
 ```bash
 git add scenario.toml README.md
 git commit -m "Setup leaderboard"
