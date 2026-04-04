@@ -17,6 +17,48 @@ Your scenario is defined across a few files:
 - **`scenario.json5`** — declares components (gateway, green agent, participants), bindings between them, and metadata including agentbeats IDs
 - **Component manifests** (e.g., `green-agent.json5`) — each component's Docker image, entrypoint, ports, and config schema
 
+Example `scenario.json5`:
+```json5
+{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      google_api_key: { type: "string", secret: true },
+      openai_api_key: { type: "string", secret: true },
+    },
+  },
+  components: {
+    gateway: {
+      manifest: "https://raw.githubusercontent.com/RDI-Foundation/agentbeats-gateway/refs/tags/v0.3/amber-manifest.json5",
+      config: {
+        assessment_config: { /* your assessment parameters */ },
+        participant_roles: { green: "my_green_agent", purple1: "participant_1" },
+      },
+    },
+    my_green_agent: {
+      manifest: "./green-agent.json5",
+      config: { google_api_key: "${config.google_api_key}" },
+    },
+    participant_1: {
+      manifest: "./participant.json5",
+      config: { openai_api_key: "${config.openai_api_key}" },
+    },
+  },
+  bindings: [
+    { to: "#gateway.green",   from: "#my_green_agent.a2a" },
+    { to: "#gateway.purple1", from: "#participant_1.a2a" },
+  ],
+  exports: { results: "#gateway.results" },
+  metadata: {
+    agentbeats_ids: {
+      my_green_agent: "your-green-agent-id",
+      participant_1: "",  // submitter fills this in
+    },
+  },
+}
+```
+
 Fill in your green agent's details and agentbeats ID. Leave participant fields for submitters to complete.
 
 ### 3. Configure secrets
