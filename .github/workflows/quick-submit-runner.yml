@@ -336,6 +336,12 @@ jobs:
             echo "Scenario must export an HTTP capability named 'results'" >&2
             exit 1
           fi
+          if jq -e '.components[].program?.mounts[]? | select(.capability == "kvm")' scenario-ir.json > /dev/null; then
+            echo "Scenario uses framework.kvm; exporting AMBER_KVM_GID to Docker Compose"
+            echo "AMBER_KVM_GID=$(stat -c %g /dev/kvm)" >> "${GITHUB_ENV}"
+          else
+            echo "Scenario does not use framework.kvm"
+          fi
 
       - name: Run scenario — shard-${{ matrix.shard_index }}
         shell: bash
