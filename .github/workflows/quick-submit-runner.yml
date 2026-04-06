@@ -477,6 +477,7 @@ jobs:
     permissions:
       id-token: write
       contents: write
+      statuses: write
     defaults:
       run:
         shell: bash
@@ -585,6 +586,17 @@ jobs:
           git add "results/${BASE}.json" "submissions/${BASE}-provenance.json"
           git commit -m "[AgentBeats] Scenario results"
           git push
+
+      - name: Set status on results commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RESULTS_SHA=$(git rev-parse HEAD)
+          gh api "repos/${{ github.repository }}/statuses/${RESULTS_SHA}" \
+            -f state=success \
+            -f context="run-scenario" \
+            -f description="Scenario completed successfully" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       # Cleanup: delete secrets from backend.
       # Skipped when no backend is configured.
