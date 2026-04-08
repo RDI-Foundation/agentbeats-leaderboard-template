@@ -1,79 +1,345 @@
+# Self-run workflow — fork owners trigger this by pushing changes to scenario.json5.
 name: Run Scenario
 
 on:
   push:
-    branches: ['**']
+    branches-ignore:
+      - main
     paths:
-      - 'scenario.toml'
+      - 'scenario.json5'
+  workflow_dispatch:
+    inputs:
+      num_shards:
+        description: "Number of parallel shards"
+        default: "1"
+        type: string
+      num_instances:
+        description: "Total number of task instances to run across all shards (empty = all)"
+        default: ""
+        type: string
+
+env:
+  NUM_SHARDS: ${{ inputs.num_shards || '1' }}
 
 jobs:
-  run:
+  setup:
     runs-on: ubuntu-latest
-    if: github.event.repository.fork == true || github.ref != 'refs/heads/main'
-    permissions:
-      contents: write
-      packages: read
-
+    outputs:
+      shard_indices: ${{ steps.gen.outputs.shard_indices }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
+      - name: Generate shard matrix
+        id: gen
+        run: echo "shard_indices=$(seq 0 $(( ${{ inputs.num_shards || '1' }} - 1 )) | jq -sc .)" >> "$GITHUB_OUTPUT"
 
-      - name: Install dependencies
-        run: pip install tomli tomli-w pyyaml requests
+  eval:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      matrix:
+        shard_index: ${{ fromJSON(needs.setup.outputs.shard_indices) }}
+      fail-fast: false
 
-      - name: Generate docker-compose.yml
-        run: python generate_compose.py --scenario scenario.toml
+    permissions:
+      contents: read
 
-      - name: Pull images
+    env:
+      AMBER_IMAGE: ghcr.io/rdi-foundation/amber-cli:v0.3
+      AMBER_COMPOSE_DIR: amber-compose
+      AMBER_COMPOSE_PROJECT: amber-scenario-${{ github.run_id }}-${{ github.run_attempt }}-shard-${{ matrix.shard_index }}
+      AMBER_PROXY_PORT: "18080"
+      RESULTS_TIMEOUT_MINUTES: ${{ vars.RUN_SCENARIO_TIMEOUT_MINUTES || '300' }}
+
+    steps:
+      - name: Free disk space
+        # GitHub-hosted runners ship with ~20-30 GB of pre-installed toolchains
+        # (.NET, Android SDK, GraalVM, Chromium, etc.) not needed.
+        # Benchmark scenarios often pull large Docker images.
+        # See https://github.com/marketplace/actions/free-disk-space-ubuntu
         run: |
-          if ! docker compose pull; then
-            echo ""
-            echo "Error: Failed to pull one or more images."
-            echo "Ensure all images are publicly accessible."
-            echo "For ghcr.io images, check package settings at:"
-            echo "  https://github.com/orgs/YOUR_ORG/packages or"
-            echo "  https://github.com/users/YOUR_USER/packages"
-            exit 1
-          fi
+          echo "Before: $(df -h / | tail -1 | awk '{print $4}') free"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/chromium /usr/local/graalvm /opt/hostedtoolcache 2>/dev/null || true
+          sudo docker image prune -af 2>/dev/null || true
+          echo "After: $(df -h / | tail -1 | awk '{print $4}') free"
 
-      - name: Create output directory
-        run: mkdir -p output && chmod 777 output
+      - name: Checkout
+        uses: actions/checkout@v6
 
-      - name: Export secrets as environment variables
+      - name: Export AMBER_CONFIG vars
         env:
           SECRETS_JSON: ${{ toJSON(secrets) }}
         run: |
-          echo "$SECRETS_JSON" | jq -r 'to_entries|map("\(.key)=\(.value)")|.[]' > .env
+          set -euo pipefail
+          # Export all repo secrets as AMBER_CONFIG_* env vars.
+          # Secret names should match the scenario config_schema path with double
+          # underscores as separators, e.g. a secret named FOO__BAR maps to
+          # config.foo.bar in the scenario.
+          echo "$SECRETS_JSON" | jq -r \
+            'to_entries[] | select(.key != "GITHUB_TOKEN") | "AMBER_CONFIG_\(.key | ascii_upcase)=\(.value | sub("\\s+$";""))"' \
+            >> "${GITHUB_ENV}"
 
-      - name: Check if GHCR_TOKEN is available
-        id: check_ghcr
-        env:
-          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+      - name: Patch shard config into scenario
         run: |
-          if [ -n "$GHCR_TOKEN" ]; then
-            echo "has_token=true" >> $GITHUB_OUTPUT
-          else
-            echo "has_token=false" >> $GITHUB_OUTPUT
+          npx json5 scenario.json5 | jq \
+            --argjson shard_index ${{ matrix.shard_index }} \
+            --argjson num_shards ${NUM_SHARDS} \
+            --argjson num_instances '${{ inputs.num_instances || 'null' }}' \
+            '
+             .components.gateway.config.assessment_config.shard_index = $shard_index |
+             .components.gateway.config.assessment_config.num_shards = $num_shards |
+             if $num_instances then .components.gateway.config.assessment_config.num_instances = $num_instances else . end
+            ' > patched.json
+          mv patched.json scenario.json5
+
+      - name: Install amber CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "${AMBER_IMAGE}"
+          cid="$(docker create "${AMBER_IMAGE}")"
+          cleanup() { docker rm "${cid}" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          install -d "${RUNNER_TEMP}/bin"
+          docker cp "${cid}:/amber" "${RUNNER_TEMP}/bin/amber"
+          chmod +x "${RUNNER_TEMP}/bin/amber"
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+          "${RUNNER_TEMP}/bin/amber" --help >/dev/null
+
+      - name: Compile scenario
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "${AMBER_COMPOSE_DIR}"
+          amber compile scenario.json5 \
+            --output scenario-ir.json \
+            --docker-compose "${AMBER_COMPOSE_DIR}"
+          if ! jq -e '.exports[] | select(.name == "results" and .capability.kind == "http")' scenario-ir.json > /dev/null; then
+            echo "Scenario must export an HTTP capability named 'results'" >&2
+            exit 1
           fi
 
-      - name: Login to GitHub Container Registry
-        if: steps.check_ghcr.outputs.has_token == 'true'
-        uses: docker/login-action@v3
+      - name: Run scenario — shard-${{ matrix.shard_index }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          compose=(docker compose -f "${AMBER_COMPOSE_DIR}/compose.yaml" -p "${AMBER_COMPOSE_PROJECT}")
+          proxy_pid=""
+          logs_pid=""
+          cleanup() {
+            exit_code=$?
+            if [[ -n "${proxy_pid}" ]]; then
+              kill "${proxy_pid}" >/dev/null 2>&1 || true
+              wait "${proxy_pid}" >/dev/null 2>&1 || true
+            fi
+            if [[ -n "${logs_pid}" ]]; then
+              kill "${logs_pid}" >/dev/null 2>&1 || true
+              wait "${logs_pid}" >/dev/null 2>&1 || true
+            fi
+            if [[ ${exit_code} -ne 0 ]]; then
+              echo "Amber proxy log:" >&2
+              [[ -f amber-proxy.log ]] && cat amber-proxy.log >&2 || true
+              echo "Compose status:" >&2
+              "${compose[@]}" ps >&2 || true
+            fi
+            exit "${exit_code}"
+          }
+          trap cleanup EXIT
+
+          "${compose[@]}" pull --quiet
+
+          # Generate provenance (image digests + manifest digests).
+          # All shards compile the same scenario and pull the same images,
+          # so provenance is identical; summary picks one.
+          image_digests=$(jq -r '.components[] | select(.program) | "\(.moniker)=\(.program.image)"' scenario-ir.json | while IFS='=' read -r name image; do
+            digest=$(docker image inspect "$image" --format '{{index .RepoDigests 0}}')
+            printf '%s\t%s\n' "$name" "$digest"
+          done | jq -Rn '[inputs | split("\t") | {(.[0]): .[1]}] | add // {}')
+          manifest_digests=$(jq '[.components[] | {(.moniker): .digest}] | add // {}' scenario-ir.json)
+          timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          mkdir -p "${AMBER_COMPOSE_DIR}/output"
+          jq -n \
+            --argjson image_digests "$image_digests" \
+            --argjson manifest_digests "$manifest_digests" \
+            --arg timestamp "$timestamp" \
+            --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg ref "${{ github.ref }}" \
+            --arg sha "${{ github.sha }}" \
+            --arg repository_url "${{ github.server_url }}/${{ github.repository }}" \
+            --arg workflow_ref "${{ github.workflow_ref }}" \
+            --arg workflow_sha "${{ github.workflow_sha }}" \
+            '{
+              image_digests: $image_digests,
+              manifest_digests: $manifest_digests,
+              timestamp: $timestamp,
+              github_actions: {
+                run_url: $run_url,
+                ref: $ref,
+                sha: $sha,
+                repository_url: $repository_url,
+                workflow_ref: $workflow_ref,
+                workflow_sha: $workflow_sha
+              }
+            }' > "${AMBER_COMPOSE_DIR}/output/provenance.json"
+          echo "Provenance:"
+          cat "${AMBER_COMPOSE_DIR}/output/provenance.json"
+
+          "${compose[@]}" up -d
+          "${compose[@]}" logs -f --no-color &
+          logs_pid=$!
+
+          amber proxy "${AMBER_COMPOSE_DIR}" \
+            --project-name "${AMBER_COMPOSE_PROJECT}" \
+            --export "results=127.0.0.1:${AMBER_PROXY_PORT}" > amber-proxy.log 2>&1 &
+          proxy_pid=$!
+
+          poll_url="http://127.0.0.1:${AMBER_PROXY_PORT}/"
+          echo "Polling ${poll_url} for shard ${{ matrix.shard_index }}..."
+          status=""
+          deadline=$((SECONDS + (60 * RESULTS_TIMEOUT_MINUTES)))
+          while (( SECONDS < deadline )); do
+            if ! kill -0 "${proxy_pid}" >/dev/null 2>&1; then
+              echo "amber proxy exited unexpectedly" >&2
+              exit 1
+            fi
+            response="$(curl -fsS "${poll_url}" || true)"
+            if [[ -z "${response}" ]]; then
+              sleep 5
+              continue
+            fi
+            status="$(jq -r '.status // empty' <<<"${response}")"
+            if [[ -z "${status}" ]]; then
+              echo "Unexpected results payload:" >&2
+              echo "${response}" >&2
+              sleep 5
+              continue
+            fi
+            if [[ "${status}" != "running" ]]; then
+              mkdir -p "${AMBER_COMPOSE_DIR}/output"
+              jq . <<<"${response}" > "${AMBER_COMPOSE_DIR}/output/results.json"
+              echo "Shard ${{ matrix.shard_index }} finished with status: ${status}"
+              break
+            fi
+            sleep 5
+          done
+          if [[ ! -f "${AMBER_COMPOSE_DIR}/output/results.json" ]]; then
+            echo "Timed out waiting ${RESULTS_TIMEOUT_MINUTES} minutes for shard results" >&2
+            exit 1
+          fi
+          if [[ "${status}" != "completed" ]]; then
+            echo "Shard failed:" >&2
+            cat "${AMBER_COMPOSE_DIR}/output/results.json" >&2
+            exit 1
+          fi
+        timeout-minutes: 300
+
+      - name: Stop scenario
+        if: always()
+        run: docker compose -f "${AMBER_COMPOSE_DIR}/compose.yaml" -p "${AMBER_COMPOSE_PROJECT}" down -v --remove-orphans || true
+
+      - name: Upload shard results
+        if: always()
+        uses: actions/upload-artifact@v7
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TOKEN }}
+          name: shard-${{ matrix.shard_index }}
+          path: |
+            ${{ env.AMBER_COMPOSE_DIR }}/output/results.json
+            ${{ env.AMBER_COMPOSE_DIR }}/output/provenance.json
 
-      - name: Run assessment
-        run: docker compose up --timestamps --no-color --exit-code-from agentbeats-client --abort-on-container-exit
+  summary:
+    needs: [setup, eval]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download all shard artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: shard-artifacts
+          pattern: shard-*
+          merge-multiple: false
 
-      - name: Record provenance
-        run: python record_provenance.py --compose docker-compose.yml --output output/provenance.json
+      - name: Aggregate results
+        run: |
+          set -euo pipefail
+          # Single-artifact downloads extract flat; normalize to subdirs
+          if [[ -f "shard-artifacts/results.json" && ! -d "shard-artifacts/shard-0" ]]; then
+            mkdir -p shard-artifacts/shard-0
+            mv shard-artifacts/results.json shard-artifacts/shard-0/
+            mv shard-artifacts/provenance.json shard-artifacts/shard-0/ 2>/dev/null || true
+          fi
+          # Build expected file paths from shard count
+          shard_results=()
+          for i in $(seq 0 $(( ${NUM_SHARDS} - 1 ))); do
+            f="shard-artifacts/shard-${i}/results.json"
+            if [[ ! -f "$f" ]]; then
+              echo "ERROR: missing results for shard ${i}" >&2
+              ls -R shard-artifacts/ >&2 || true
+              exit 1
+            fi
+            shard_results+=("$f")
+          done
+          # Extract participants (agentbeats IDs) from scenario
+          participants=$(npx json5 scenario.json5 | jq '.metadata.agentbeats_ids // {}')
+          jq -s --argjson participants "$participants" '{
+            status: (if all(.[]; .status == "completed") then "completed"
+                    elif any(.[]; .status == "completed") then "partial"
+                    else "failed" end),
+            participants: $participants,
+            results: [.[].results[]]
+          }' "${shard_results[@]}" > results.json
+
+      - name: Validate and merge provenance
+        run: |
+          set -euo pipefail
+          shard_provenance=()
+          for i in $(seq 0 $(( ${NUM_SHARDS} - 1 ))); do
+            f="shard-artifacts/shard-${i}/provenance.json"
+            if [[ ! -f "$f" ]]; then
+              echo "ERROR: missing provenance for shard ${i}" >&2
+              ls -R shard-artifacts/ >&2 || true
+              exit 1
+            fi
+            shard_provenance+=("$f")
+          done
+          # image_digests and github_actions must be identical across shards
+          expected_image_digests=$(jq '.image_digests' "${shard_provenance[0]}")
+          expected_github_actions=$(jq '.github_actions' "${shard_provenance[0]}")
+          timestamps='[]'
+          manifest_digests='[]'
+          for f in "${shard_provenance[@]}"; do
+            got=$(jq '.image_digests' "$f")
+            if [[ "$got" != "$expected_image_digests" ]]; then
+              echo "ERROR: image_digests mismatch in $f" >&2; exit 1
+            fi
+            got=$(jq '.github_actions' "$f")
+            if [[ "$got" != "$expected_github_actions" ]]; then
+              echo "ERROR: github_actions mismatch in $f" >&2; exit 1
+            fi
+            timestamps=$(echo "$timestamps" | jq --argjson ts "$(jq '.timestamp' "$f")" '. + [$ts]')
+            manifest_digests=$(echo "$manifest_digests" | jq --argjson md "$(jq '.manifest_digests' "$f")" '. + [$md]')
+          done
+          # Use the first shard's values (all shards are identical).
+          jq -n \
+            --argjson image_digests "$expected_image_digests" \
+            --argjson manifest_digests "$(echo "$manifest_digests" | jq '.[0]')" \
+            --arg timestamp "$(echo "$timestamps" | jq -r '.[0]')" \
+            --argjson github_actions "$expected_github_actions" \
+            '{
+              image_digests: $image_digests,
+              manifest_digests: $manifest_digests,
+              timestamp: $timestamp,
+              github_actions: $github_actions
+            }' > provenance.json
+          echo "Provenance:"
+          cat provenance.json
 
       - name: Generate submission metadata
         id: metadata
@@ -84,45 +350,44 @@ jobs:
           echo "unique_name=$UNIQUE_NAME" >> $GITHUB_OUTPUT
           echo "branch_name=submission-${UNIQUE_NAME}" >> $GITHUB_OUTPUT
 
-      - name: Copy files to submission directory
-        run: |
-          cp scenario.toml submissions/${{ steps.metadata.outputs.unique_name }}.toml
-          cp output/results.json results/${{ steps.metadata.outputs.unique_name }}.json
-          cp output/provenance.json submissions/${{ steps.metadata.outputs.unique_name }}.provenance.json
-
       - name: Determine target repository
         id: target
         env:
-            GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-            PARENT_REPO=$(gh api repos/${{ github.repository }} --jq '.parent.full_name // "${{ github.repository }}"')
-            echo "Target repository: $PARENT_REPO"
-            echo "repo=$PARENT_REPO" >> $GITHUB_OUTPUT
+          PARENT_REPO=$(gh api repos/${{ github.repository }} --jq '.parent.full_name // "${{ github.repository }}"')
+          echo "Target repository: $PARENT_REPO"
+          echo "repo=$PARENT_REPO" >> $GITHUB_OUTPUT
 
-      - name: Create submission branch
+      - name: Create submission branch and commit results
+        env:
+          UNIQUE_NAME: ${{ steps.metadata.outputs.unique_name }}
+          BRANCH_NAME: ${{ steps.metadata.outputs.branch_name }}
+          TARGET_REPO: ${{ steps.target.outputs.repo }}
         run: |
-          git remote add upstream https://github.com/${{ steps.target.outputs.repo }}.git
+          cp scenario.json5 /tmp/scenario.json5
+          git remote add upstream https://github.com/${TARGET_REPO}.git
           git fetch upstream
-          git checkout -b ${{ steps.metadata.outputs.branch_name }} upstream/main
-
-      - name: Commit results
-        run: |
+          git checkout -b ${BRANCH_NAME} upstream/main
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add submissions/${{ steps.metadata.outputs.unique_name }}.toml submissions/${{ steps.metadata.outputs.unique_name }}.provenance.json results/${{ steps.metadata.outputs.unique_name }}.json
-          git commit -m "Submission: ${{ steps.metadata.outputs.unique_name }}
+          mkdir -p results submissions
+          cp /tmp/scenario.json5 "submissions/${UNIQUE_NAME}.json5"
+          mv results.json "results/${UNIQUE_NAME}.json"
+          mv provenance.json "submissions/${UNIQUE_NAME}-provenance.json"
+          git add "results/${UNIQUE_NAME}.json" "submissions/${UNIQUE_NAME}-provenance.json" "submissions/${UNIQUE_NAME}.json5"
+          git commit -m "Submission: ${UNIQUE_NAME}
 
           Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          git push origin ${{ steps.metadata.outputs.branch_name }}
-          echo "::notice title=Submission Branch Created::Your results are ready for submission on branch: ${{ steps.metadata.outputs.branch_name }}"
+          git push origin ${BRANCH_NAME}
+          echo "::notice title=Submission Branch Created::Your results are ready for submission on branch: ${BRANCH_NAME}"
 
       - name: Output PR link
+        env:
+          TARGET_REPO: ${{ steps.target.outputs.repo }}
+          BRANCH_NAME: ${{ steps.metadata.outputs.branch_name }}
         run: |
           echo "### Submit your results" >> $GITHUB_STEP_SUMMARY
-          echo "[Click here to open a pull request](https://github.com/${{ steps.target.outputs.repo }}/compare/main...${{ github.repository_owner }}:${{ github.event.repository.name }}:${{ steps.metadata.outputs.branch_name }}?expand=1)" >> $GITHUB_STEP_SUMMARY
+          echo "[Click here to open a pull request](https://github.com/${TARGET_REPO}/compare/main...${{ github.repository_owner }}:${{ github.event.repository.name }}:${BRANCH_NAME}?expand=1)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "⚠️ When creating the PR, UNCHECK 'Allow edits and access to secrets by maintainers' to protect your secrets." >> $GITHUB_STEP_SUMMARY
-
-      - name: Cleanup
-        if: always()
-        run: docker compose down -v || true
+          echo "When creating the PR, UNCHECK 'Allow edits and access to secrets by maintainers' to protect your secrets." >> $GITHUB_STEP_SUMMARY
