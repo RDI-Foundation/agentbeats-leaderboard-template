@@ -12,6 +12,7 @@ jobs:
     permissions:
       id-token: write
       contents: write
+      statuses: write
     with:
       num_shards: 1
     # Optional: bind leaderboard-repo secrets into the green agent during Quick Submit.
