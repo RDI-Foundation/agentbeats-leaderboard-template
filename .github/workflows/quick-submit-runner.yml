@@ -24,13 +24,11 @@ on:
         description: Optional JSON object mapping green config key -> secret value.
         required: false
 
-env:
-  NUM_SHARDS: ${{ inputs.num_shards || 1 }}
-
 jobs:
   setup:
     runs-on: ubuntu-latest
     outputs:
+      num_shards: ${{ steps.config.outputs.num_shards }}
       shard_indices: ${{ steps.gen.outputs.shard_indices }}
       scenario_path: ${{ steps.scenario.outputs.path }}
       scenario_base: ${{ steps.scenario.outputs.base }}
@@ -69,8 +67,29 @@ jobs:
           echo "path=$scenario" >> "$GITHUB_OUTPUT"
           echo "base=$base" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve shard count
+        id: config
+        shell: bash
+        env:
+          INPUT_NUM_SHARDS: ${{ inputs.num_shards }}
+          SCENARIO_PATH: ${{ steps.scenario.outputs.path }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${INPUT_NUM_SHARDS}" ]]; then
+            num_shards="${INPUT_NUM_SHARDS}"
+          else
+            num_shards="$(jq -r '.components.gateway.config.assessment_config.num_shards // 1' "${SCENARIO_PATH}")"
+          fi
+
+          if ! [[ "${num_shards}" =~ ^[0-9]+$ ]] || [[ "${num_shards}" -lt 1 ]]; then
+            echo "Invalid num_shards: ${num_shards}" >&2
+            exit 1
+          fi
+
+          echo "num_shards=${num_shards}" >> "$GITHUB_OUTPUT"
+
       - id: gen
-        run: echo "shard_indices=$(seq 0 $(( ${{ inputs.num_shards || 1 }} - 1 )) | jq -sc .)" >> "$GITHUB_OUTPUT"
+        run: echo "shard_indices=$(seq 0 $(( ${{ steps.config.outputs.num_shards }} - 1 )) | jq -sc .)" >> "$GITHUB_OUTPUT"
 
   eval:
     needs: setup
@@ -86,6 +105,7 @@ jobs:
       contents: read
 
     env:
+      NUM_SHARDS: ${{ needs.setup.outputs.num_shards }}
       AGENTBEATS_URL: ${{ inputs.backend_url || vars.QUICK_SUBMIT_BACKEND_URL || 'https://agentbeats.dev' }}
       OIDC_AUDIENCE: ${{ vars.QUICK_SUBMIT_OIDC_AUDIENCE || 'agentbeats-quick-submit-production' }}
       GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER || 'projects/352582078246/locations/global/workloadIdentityPools/agentbeats-prod/providers/github' }}
@@ -483,6 +503,7 @@ jobs:
     env:
       AGENTBEATS_URL: ${{ vars.QUICK_SUBMIT_BACKEND_URL || 'https://agentbeats.dev' }}
       OIDC_AUDIENCE: ${{ vars.QUICK_SUBMIT_OIDC_AUDIENCE || 'agentbeats-quick-submit-production' }}
+      NUM_SHARDS: ${{ needs.setup.outputs.num_shards }}
       SCENARIO_PATH: ${{ needs.setup.outputs.scenario_path }}
     steps:
       - uses: actions/checkout@v6
