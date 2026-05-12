@@ -12,7 +12,10 @@ on:
         required: false
         type: string
       num_shards:
-        description: Number of parallel shards to run (default 1)
+        description: >-
+          Soft default number of parallel shards. Used only when the submitted
+          scenario does not set assessment_config.num_shards. The submitter's
+          value takes precedence. Clamped to 20.
         required: false
         type: number
       num_instances:
@@ -71,19 +74,30 @@ jobs:
         id: config
         shell: bash
         env:
-          INPUT_NUM_SHARDS: ${{ inputs.num_shards }}
+          INPUT_NUM_SHARDS: ${{ inputs.num_shards || '' }}
           SCENARIO_PATH: ${{ steps.scenario.outputs.path }}
         run: |
           set -euo pipefail
-          if [[ -n "${INPUT_NUM_SHARDS}" ]]; then
+
+          GITHUB_MATRIX_CAP=20
+
+          scenario_num_shards="$(jq -r '.components.gateway.config.assessment_config.num_shards' "${SCENARIO_PATH}")"
+          if [[ "${scenario_num_shards}" != "null" ]]; then
+            num_shards="${scenario_num_shards}"
+          elif [[ -n "${INPUT_NUM_SHARDS}" ]]; then
             num_shards="${INPUT_NUM_SHARDS}"
           else
-            num_shards="$(jq -r '.components.gateway.config.assessment_config.num_shards // 1' "${SCENARIO_PATH}")"
+            num_shards=1
           fi
 
           if ! [[ "${num_shards}" =~ ^[0-9]+$ ]] || [[ "${num_shards}" -lt 1 ]]; then
             echo "Invalid num_shards: ${num_shards}" >&2
             exit 1
+          fi
+
+          if (( num_shards > GITHUB_MATRIX_CAP )); then
+            echo "Clamping num_shards from ${num_shards} to ${GITHUB_MATRIX_CAP} (GitHub matrix cap)" >&2
+            num_shards=${GITHUB_MATRIX_CAP}
           fi
 
           echo "num_shards=${num_shards}" >> "$GITHUB_OUTPUT"
