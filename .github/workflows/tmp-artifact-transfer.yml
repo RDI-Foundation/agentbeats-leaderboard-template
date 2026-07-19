@@ -1,0 +1,21 @@
+name: Temporary artifact transfer test
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test-artifact:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create test file
+        run: |
+          printf 'artifact transfer test\n' > test-output.txt
+      - name: Upload test artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tmp-transfer-test
+          path: test-output.txt
